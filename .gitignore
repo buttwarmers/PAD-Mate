@@ -27,6 +27,18 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Big files and hidden stuff
+*.npy
+*.npz
+hidden/
+assets/converted
+assets/icons/cards
+assets/icons/card_icons.npz
+assets/raw
+assets/portraits
+modules/tests
+modules/old_versions
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
