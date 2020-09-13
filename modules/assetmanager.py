@@ -16,11 +16,11 @@ import cv2
 
 try:
     from .texturetool import TextureWriter, TextureReader
-    from .utils import timeit, imread_rgb
+    from .utils import timeit, imread_rgba
 except:
     os.chdir(os.path.dirname(__file__))
     from texturetool import TextureWriter, TextureReader
-    from utils import timeit, imread_rgb
+    from utils import timeit, imread_rgba
 
 # =============================================================================
 # GLOBALS
@@ -483,22 +483,22 @@ class AssetManager():
         name = f'{attr}_main_{sattr}_sub.png' if sattr else f'{attr}_main.png'
         filepath = os.path.join(self.dirs['card_borders'], name)
         if os.path.exists(filepath):
-            return imread_rgb(filepath)
+            return imread_rgba(filepath)
         return self.generate_empty_icon(attr, sattr)
     
     @staticmethod
-    def get_standard_template():
+    def load_standard_template():
         dirs = AssetManager.get_folders()
         filepath = os.path.join(dirs['feature_templates'], 'standard_template.png')
         if not os.path.exists(filepath):
             return print(f'{filepath} does not exist')
         try:
-            return imread_rgb(filepath)
+            return imread_rgba(filepath)
         except Exception as ex:
             return print(f'Could not load standard template from {filepath}\n{ex}')
     
     @timeit
-    def compile_all_icons(self):
+    def compile_card_icons(self):
         print('\nCompiling all icons...\n')
         icons = {}
         df = self.assets[~self.assets['CardIconFilepath'].isna()]
@@ -507,7 +507,7 @@ class AssetManager():
             print(f'{len(df) - i} remaining...')
             monster_id = row['MonsterId']
             filepath = row['CardIconFilepath']
-            img = imread_rgb(filepath)
+            img = imread_rgba(filepath)
             
             # get card name
             name = self.name_from_id(monster_id)
@@ -521,10 +521,10 @@ class AssetManager():
         return icons
     
     @timeit
-    def load_all_icons(self):
+    def load_card_icons(self):
         load_path = os.path.join(self.dirs['icons'], 'card_icons.npz')
         if not os.path.exists(load_path):
-            return self.compile_all_icons()
+            return self.compile_card_icons()
         try:
             icons_npz = np.load(load_path, allow_pickle=False)
             icons = {name: icons_npz[name] for name in icons_npz.files}
@@ -534,7 +534,7 @@ class AssetManager():
         
     def load_orb_icons(self):
         folder = self.dirs['card_borders']
-        self.orb_icons = {attr: imread_rgb(os.path.join(folder, f'{attr}_orb.png'))
+        self.orb_icons = {attr: imread_rgba(os.path.join(folder, f'{attr}_orb.png'))
                           for attr in self.attributes}
         return self.orb_icons
     
@@ -542,7 +542,7 @@ class AssetManager():
     def compile_icons_by_attributes(self):
         print('\nCompiling icons by attributes...\n')
         cards = self.get_cards_by_attributes(require_icon=True)
-        icons = self.load_all_icons()
+        icons = self.load_card_icons()
         icon_h, icon_w = np.array(list(icons.values())[0]).shape[0:2]
         
         def stitch_icons(attributes: str):
@@ -613,7 +613,7 @@ class AssetManager():
             
             # load the image
             try:
-                icon_info[attr]['icons'] = imread_rgb(image_path)
+                icon_info[attr]['icons'] = imread_rgba(image_path)
             except:
                 icon_info[attr]['icons'] = None
                 
@@ -756,7 +756,7 @@ class AssetManager():
             pass
         
         if require_icon and not icons:
-            icons = self.load_all_icons()
+            icons = self.load_card_icons()
             if not icons:
                 print('No icons found')
                 return icons
@@ -909,9 +909,9 @@ class AssetManager():
         # self.fix_portrait_sizes(redo=True)
         # self.compile_icons_by_attributes()
         # self.generate_card_icons(update=True)
-        # self.compile_all_icons()
-        # icons = self.load_all_icons()
-        self.load_cards_by_attributes(require_icon=True)
+        self.compile_card_icons()
+        # icons = self.load_card_icons()
+        # self.load_cards_by_attributes(require_icon=True)
         # self.generate_icon_borders()
         
         # self.refresh_all_data()
@@ -923,4 +923,4 @@ if __name__ == '__main__':
     am = AssetManager()
     am.test()
     am.save_asset_info()
-
+    

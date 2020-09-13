@@ -10,22 +10,20 @@ import cv2
 from PIL import Image
 import pandas as pd
 from scipy.ndimage import gaussian_filter
-import asyncio
-
 import concurrent.futures
 from threading import Thread
 from queue import Queue
-
-import nest_asyncio
-nest_asyncio.apply()
+# import asyncio
+# import nest_asyncio
+# nest_asyncio.apply()
 
 try:
     from .assetmanager import AssetManager
-    from .utils import timeit, pt_sep, imread_rgb
+    from .utils import timeit, pt_sep, imread_rgba, imread_rgb
 except:
     os.chdir(os.path.dirname(__file__))
     from assetmanager import AssetManager
-    from utils import timeit, pt_sep, imread_rgb
+    from utils import timeit, pt_sep, imread_rgba, imread_rgb
 
 # =============================================================================
 # LOGGING
@@ -64,58 +62,61 @@ DEBUG = False
 # =============================================================================
 # MAIN MATCHING CLASS
 # =============================================================================
-class Matcher:
+class Matcher():
     def __init__(
             self, 
             input_images: list,
-            standard_scale: float = None,
+            default_scale: float = None,
             orb_crop_factor: float = 0.15,
-            
             **kwargs
             ) -> dict:
         
+        # store original inputs so we know when they've been identified
+        self.input_dict = {idx: i for idx, i in enumerate(input_images)}
+
         # store input variables
-        self.standard_scale = standard_scale
+        self.default_scale = default_scale
         self.orb_crop_factor = orb_crop_factor
         
+        # store empty variables
+        self.raw_input_images = []
+        self.matched_images = []
+        self.matched_cards = []
+        
         # parse the input images
-        self.input_images = self.add_inputs(input_images)
-        self.num_input_images = len(self.input_images)
+        self.rgb_input_images = self.add_inputs(input_images)
+        self.num_input_images = len(self.rgb_input_images)
         if self.num_input_images == 0:
             return print('No input images provided')
         print(f'Got {self.num_input_images} input images')
-        
-        # get event loop
-        self.loops = {'main': asyncio.get_event_loop()}
         
         # initialize the asset manager and load required assets
         self._load_required_assets()
         
     def add_inputs(self, inputs: list):
         inputs = [inputs] if not isinstance(inputs, list) else inputs
-        input_images = []
         for item in inputs:
-            img = self.imarray(item)
-            if isinstance(img, str):
-                if not os.path.exists(img):
-                    print(f'{img} does not exist')
+            if isinstance(item, str):
+                if not os.path.exists(item):
+                    print(f'{item} does not exist')
                     continue
-                img = load_img(img)
+                # img = cv2.imread(item, cv2.IMREAD_UNCHANGED)
+                img = imread_rgb(item)
                 # TODO: handle URLs and videos
-            input_images.append(img) if img is not None else None
-        return input_images
+            img = to_numpy(img)
+            self.raw_input_images.append(img) if img is not None else None
+        return self.raw_input_images
     
     # =============================================================================
     # CLASS METHODS
     # =============================================================================
     @staticmethod
-    def standardize_input_image(image: np.ndarray) -> np.ndarray:
-        image = imarray(image)
-        rgb = to_rgb(image)
+    def standardize_input_image(image: np.ndarray, rgb: bool = True) -> np.ndarray:
+        image = to_numpy(image)
+        rgb = to_rgb(image) if not rgb else image
         h, w = image.shape[0:2]
         scale = min(1.0, DEFAULT_SCREENSHOT_WIDTH / w)
-        rescaled = rescale(rgb, scale)
-        return gauss_sharpen(rescaled)
+        return rescale(rgb, scale)
     
     @staticmethod
     def crop_orb(orb: np.ndarray, crop_factor: float = 0.15) -> np.ndarray:
@@ -129,28 +130,43 @@ class Matcher:
         return icon[dh0:-dh1, dw0:-dw1]
     
     @staticmethod
-    def fix_template(template: np.ndarray, scale: float) -> np.ndarray:
-        template = np.array(Image.fromarray(template, mode='RGBA').convert('L'))
+    def standardize_template(template: np.ndarray, scale: float) -> np.ndarray:
+        template = to_gray(template)
         temp_w, temp_h = template.shape[1], template.shape[0]
         dsize = (int(scale * temp_w), int(scale * temp_h))
-        template = cv2.resize(template, dsize=dsize, interpolation=INTERPOLATION)
+        if scale != 1.0:
+            template = cv2.resize(template, dsize=dsize, interpolation=INTERPOLATION)
         template = gauss_sharpen(template)    
         return template
     
     # =============================================================================
-    # PRIVATE FUNCTIONS
+    # PROTECTED FUNCTIONS
     # =============================================================================
+    @timeit
     def _load_required_assets(self):
-        # TODO: make these loading functions async
+        self._load_asset_manager()
+        funcs = (self._load_card_icons, self._load_orb_icons,
+                 self._load_standard_template, self._load_cards_by_attributes)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            [pool.submit(func) for func in funcs]
+        print('loaded required assets')
+            
+    def _load_asset_manager(self):
         self.asset_manager = AssetManager()
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            
-            self.card_icons = self.asset_manager.load_all_icons()
-            self.standard_template = self.asset_manager.get_standard_template()
-            self.orb_icons = self.asset_manager.load_orb_icons()
-            self.cards_by_attributes = self.asset_manager.load_cards_by_attributes()
-    
+    def _load_card_icons(self):
+        self.card_icons = self.asset_manager.load_card_icons()
+        
+    def _load_orb_icons(self):
+        self.orb_icons = self.asset_manager.load_orb_icons()
+        
+    def _load_standard_template(self):
+        template = self.asset_manager.load_standard_template()
+        self.standard_template = self.standardize_template(template, 1.0)
+        
+    def _load_cards_by_attributes(self):
+        self.cards_by_attributes = self.asset_manager.load_cards_by_attributes()
+        
     # =============================================================================
     # SUB-ROUTINES
     # =============================================================================
@@ -220,22 +236,21 @@ class Matcher:
         
         # save result image
         match_path = os.path.abspath(f'./tests/{name}.png')
-        cv2.imwrite(match_path, img)
+        Image.fromarray(img).save(match_path)
             
         # save heatmap
         confidence_map = matches.get('confidence_map', None)
         if save_heatmap and confidence_map is not None:
             heatmap_path = os.path.abspath(f'./tests/{name}_map.png')
-            cv2.imwrite(heatmap_path, confidence_map*(255*np.amax(confidence_map)))
+            normalized = confidence_map*(255*np.amax(confidence_map))
+            Image.fromarray(normalized).save(heatmap_path)
 
-    @classmethod
-    async def identify_region(
-            cls,
+    def identify_region(
+            self,
             input_image: np.ndarray,
             orig_img: np.ndarray,
             attributes: str,
             bbox: tuple,
-            cards_by_attributes: dict,
             icons: dict, 
             scale: float,
             offsets: tuple,
@@ -243,7 +258,7 @@ class Matcher:
             ):
         
         # get list of cards to search over
-        card_list = cards_by_attributes[attributes]
+        card_list = self.cards_by_attributes[attributes]
         
         # get the region
         (y1, x1), (y2, x2) = bbox
@@ -256,8 +271,8 @@ class Matcher:
             card_icon = icons.get(card_name, None)
             if card_icon is None:
                 continue
-            card_icon = cls.fix_template(card_icon, scale)
-            card_icon = cls.crop_icon(card_icon, offsets) if crop else card_icon
+            card_icon = self.standardize_template(card_icon, scale)
+            card_icon = self.crop_icon(card_icon, offsets) if crop else card_icon
             
             # check for a match
             result = find_matches(region, card_icon)
@@ -274,7 +289,7 @@ class Matcher:
             print(f'Matched {card_name}')
             
             # show the matched region
-            cls.show_boxes(orig_img, card_icon, result, True, False)
+            self.show_matches(orig_img, card_icon, result, True, False)
             
             # only match once
             break
@@ -287,29 +302,37 @@ class Matcher:
     # =============================================================================
     # DETECTING ICONS
     # =============================================================================
-    @timeit
-    async def detect_icons(
+    # @timeit
+    def detect_icons(
             self,
-            input_image: np.ndarray,
-            icons: dict = None,
+            raw_image: np.ndarray,
             crop: bool = True,
             save_matches: bool = True,
             save_heatmaps: bool = False
             ):
         
         # create a copy of the input to avoid modifying the original
-        img = input_image.copy()
+        img_rgb = self.standardize_input_image(raw_image.copy())
         
+        # preprocess the image for detections
+        img = self.standardize_template(img_rgb, 1.0)
+
         # get optimal rescale factor for matching
-        scale = self.loops['main'].run_until_complete(get_scale(img))
-        
+        if self.default_scale is None:
+            std_temp = self.standard_template
+            scale = get_best_scale(img, std_temp)
+            self.default_scale = scale
+        else:
+            scale = self.default_scale
+            
         # make sure icons were loaded
-        icons = {k: v for k, v in icons.items() if v is not None}
+        icons = self.card_icons
         if not icons:
             return print('Unable to load icons: exiting...')
         
         # get original icon size (should be 100 x 100 px)
-        orig_h, orig_w = list(icons.values())[0].shape[0:2]
+        sample_icon = list(icons.values())[0]
+        orig_h, orig_w = sample_icon.shape[0:2]
         
         # get new dimensions based on optimal rescale factor
         new_w, new_h = (int(scale*orig_w), int(scale*orig_h))
@@ -329,9 +352,10 @@ class Matcher:
         dw0, dw1 = (0, 1) if (dw0 + dw1) >= new_w else (dw0, dw1)
         icon_offsets = ((dw0, dw1), (dh0, dh1))
         
-        # load orbs
-        orbs = {k: self.fix_template(v, scale) for k, v in orbs.items()}
+        # fix orb icons
+        orbs = {k: self.standardize_template(v, scale) for k, v in self.orb_icons.items()}
         orb_h, orb_w = list(orbs.values())[0].shape
+        print(orb_w, orb_h)
         
         # detect orb positions
         print('\nDetecting attributes...')
@@ -340,7 +364,7 @@ class Matcher:
                         for color, orb in orbs.items())}
         
         # save images of orb results
-        [self.show_boxes(self.img_raw, orbs[color], res, False, save_heatmaps)
+        [self.show_matches(img_rgb, orbs[color], res, False, save_heatmaps)
          for color, res in orb_results.items()]
         
         # report how many of each orb type was detected
@@ -419,26 +443,29 @@ class Matcher:
             
         # save a picture of the predicted card positions
         pairs_path = os.path.abspath('./tests/predicted card positions.png')
-        cv2.imwrite(pairs_path, pairs_img)
+        Image.fromarray(pairs_img).save(pairs_path)
         
         # identify regions by comparing to card icons
         print('\nIdentifying regions...\n')
-        print(cards_by_attributes)
-        matched_cards = await asyncio.gather(*(identify_region(
-                                                img, img_rgb, attrs, bbox, 
-                                                cards_by_attributes, icons,
-                                                scale, icon_offsets, crop)
-                                                for (attrs, bbox) in card_bboxes))
-        matched_cards = [m for mc in matched_cards for m in mc]
-        
-    
-        # show the matched icon results
-    
         # TODO: skip icon regions that are cut off at top or bottom
-                    
+        # matched_cards = await asyncio.gather(*(self.identify_region(
+        #                                         img, img_rgb, attrs, bbox, 
+        #                                         self.cards_by_attributes, icons,
+        #                                         scale, icon_offsets, crop)
+        #                                         for (attrs, bbox) in card_bboxes))
+        matched_cards = []
+        for (attrs, bbox) in card_bboxes:
+            matched_cards += self.identify_region(img, img_rgb, attrs, bbox, 
+                                                  icons, scale, icon_offsets, crop)
+                                                      
+        
+        # update the list of all matched cards
+        self.matched_cards.append(matched_cards)
+    
         num_matches = len(matched_cards)
         print(f'\n{num_matches} cards matched ({num_expected_matches} predicted)\n')
         
+        # print the matched icon results
         for res in matched_cards:
             print('Name:', res.get('name', ''))
             for category, value in res.items():
@@ -447,11 +474,18 @@ class Matcher:
                 print(f'    {category}:   {value}')
             print('\n')
         return matched_cards
+    
+    def identify_all_images(self):
+        for rgb_image in self.rgb_input_images:
+            # asyncio.run(self.detect_icons(rgb_image))
+            matches = self.detect_icons(rgb_image)
+            
+        return self.matched_cards
         
 # =============================================================================
 # OPTIMIZING SCALE
 # =============================================================================
-async def evaluate_scale(
+def evaluate_scale(
         input_image: np.ndarray, 
         template: np.ndarray, 
         scale: float
@@ -477,23 +511,19 @@ async def evaluate_scale(
     
     return (scale, result)
 
-@timeit
-async def get_scale(
+# @timeit
+def get_best_scale(
         input_image: np.ndarray, 
+        template: np.ndarray,
         min_scale: float = 0.25, 
         num_scales: int = 50
         ) -> float:
     
+    # TODO validate inputs
+    
     # store original image
     orig_img = input_image.copy()
     orig_img_h, orig_img_w = orig_img.shape[0:2]
-    
-    # load a standard icon with the same width as card icons
-    template = AssetManager.get_standard_template()
-    if template is None:
-        print('Unable to calibrate scale: standard matching template not found')
-        print(f'Using default scale: {DEFAULT_SCALE}')
-        return DEFAULT_SCALE
     
     # get downscaling factor to make sure input image is always 500px wide
     input_h, input_w = input_image.shape[0:2]
@@ -504,6 +534,8 @@ async def get_scale(
     img_w, img_h = int(downscale * orig_img_w), int(downscale * orig_img_h)
     if orig_img_w != DEFAULT_SCALE_WIDTH:
         img = cv2.resize(orig_img, (img_w, img_h), interpolation=INTERPOLATION)
+    else:
+        img = orig_img
     
     # scaling factor based on width of standard template relative to single 
     # card icon from the same screenshot
@@ -515,8 +547,8 @@ async def get_scale(
     print(f'Original template height: {orig_h}\nOriginal template width: {orig_w}')
     
     # image processing on the template
-    template = to_gray(template)
-    template = gauss_sharpen(template)
+    # template = to_gray(template)
+    # template = gauss_sharpen(template)
     
     # define minimum width based on fact that template should be at least 1/3
     # of the width of the original image (can change if matching template changes)
@@ -531,34 +563,36 @@ async def get_scale(
     scales = np.linspace(min_scale, max_scale, num_scales)
     
     # test the different scales
-    results_list = await asyncio.gather(*(evaluate_scale(img, template, scale) 
-                                          for scale in scales))
-    results = {scale: result for (scale, result) in results_list}
+    results = {res[0]: res[1] for res in [evaluate_scale(img, template, scale)
+                                          for scale in scales]}
+    
+    best_scale = sorted([(scale, res['confidence']) for scale, res in results.items()],
+                        key = lambda i: i[1])[-1][0]
     
     # get the scale associated with the highest confidence result
-    df = pd.DataFrame.from_dict(results, orient='index')
-    df.sort_values(by='confidence', inplace=True, ascending=False)
-    confidence = df['confidence'].values[0]
-    best_scale = df['scale'].values[0]
+    # df = pd.DataFrame.from_dict(results, orient='index')
+    # df.sort_values(by='confidence', inplace=True, ascending=False)
+    # confidence = df['confidence'].values[0]
+    # best_scale = df['scale'].values[0]
     
     # remove the downscaling factor
     best_scale /= downscale
     
-    # for debugging purposes
-    if DEBUG:
-        boxes = df['boxes'].values[0]
-        size = df['dimensions'].values[0]
+    # # for debugging purposes
+    # if DEBUG:
+    #     boxes = df['boxes'].values[0]
+    #     size = df['dimensions'].values[0]
         
-        print(df[['scale', 'matched', 'confidence', 'dimensions']].head(10))
-        print(f'Best scale: {best_scale:.3f}')
-        print(f'Confidence: {confidence:.3f}')
+    #     print(df[['scale', 'matched', 'confidence', 'dimensions']].head(10))
+    #     print(f'Best scale: {best_scale:.3f}')
+    #     print(f'Confidence: {confidence:.3f}')
     
-        w, h = size
-        for box in boxes:
-            cv2.rectangle(img, box, (box[0] + w, box[1] + h), LINECOLOR, LINEWIDTH)
+    #     w, h = size
+    #     for box in boxes:
+    #         cv2.rectangle(img, box, (box[0] + w, box[1] + h), LINECOLOR, LINEWIDTH)
         
-        save_path = os.path.abspath(f'./tests/optimized scale {best_scale:.2f}.png')
-        cv2.imwrite(save_path, img)
+    #     save_path = os.path.abspath(f'./tests/optimized scale {best_scale:.2f}.png')
+    #     Image.fromarray(img).save(save_path)
     
     print(f'Best scale: {best_scale:.3f}')
     return best_scale
@@ -566,18 +600,22 @@ async def get_scale(
 # =============================================================================
 # GENERAL MATCHING FUNCTION
 # =============================================================================
-def find_matches(image: np.ndarray, template: np.ndarray) -> dict:
+def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     # make sure image and template are valid
-    if not isinstance(image, np.ndarray):
-        print(f'Image must be a numpy array, not {type(image)}')
+    if not isinstance(input_image, np.ndarray):
+        print(f'Image must be a numpy array, not {type(input_image)}')
         return {}
     if not isinstance(template, np.ndarray):
         print(f'Template must be a numpy array, not {type(template)}')
         return {}
     
+    # make sure the image and template are grayscale
+    input_image = to_gray(input_image)
+    template = to_gray(template)
+    
     # make sure the template isn't too big
     temp_h, temp_w = template.shape
-    img_h, img_w = image.shape
+    img_h, img_w = input_image.shape
     if temp_h >= img_h or temp_w >= img_w:
         if temp_h >= img_h:
             old_h = temp_h
@@ -591,11 +629,11 @@ def find_matches(image: np.ndarray, template: np.ndarray) -> dict:
     
     # get matches
     try:
-        orig_res = cv2.matchTemplate(image, template, PREFERRED_METHOD)
+        orig_res = cv2.matchTemplate(input_image, template, PREFERRED_METHOD)
         
     except Exception as ex:
         print(f'Could not perform matching: {ex}')
-        print(f'Image dimensions: {image.shape}')
+        print(f'Image dimensions: {input_image.shape}')
         print(f'Template dimensions: {template.shape}')
         return {
             'matched': False,
@@ -632,6 +670,7 @@ def find_matches(image: np.ndarray, template: np.ndarray) -> dict:
     
     # return early if there are way too many matches
     if len(loc[0]) > 1000:
+        # TODO
         # # only get the best box
         # loc = np.where(res == np.amax(res))
         # # boxes = list(zip(*loc[::-1]))
@@ -658,14 +697,6 @@ def find_matches(image: np.ndarray, template: np.ndarray) -> dict:
     [boxes.append(pt) for pt in pts if not 
      any(pt_sep(pt, box) < min_sep for box in boxes)]
     
-    # base = int(template.shape[0] / 8)
-    # rounded = [(round_base_n(y, base), round_base_n(x, base)) for y, x in pts]
-    
-    # use actual coordinates for points
-    # for box in set(rounded):
-    #     # get confidence level
-    #     boxes.append(pts[rounded.index(box)])
-        
     # get number of matches
     num_matches = len(boxes)
     
@@ -691,7 +722,7 @@ def find_matches(image: np.ndarray, template: np.ndarray) -> dict:
 def gauss_sharpen(img: np.ndarray, sigma1 = 0.5, sigma2 = 1.0) -> np.ndarray:
     return gaussian_filter(img, sigma1) - gaussian_filter(img, sigma2)
 
-def imarray(image):
+def to_numpy(image):
     if isinstance(image, Image.Image):
         return np.array(image)
     elif isinstance(image, np.ndarray):
@@ -700,14 +731,6 @@ def imarray(image):
         print(f'Could not convert {type(image)} to numpy array')
         return image
 
-def load_img(filepath: str, rgb: bool = True):
-    if not os.path.exists(filepath):
-        return print(f'{filepath} does not exist')
-    try:
-        return imread_rgb(filepath)
-    except Exception as ex:
-        return print(f'Unable to read {filepath}:\n{ex}')
-    
 def to_gray(image: np.ndarray) -> np.ndarray:
     if image.ndim == 2:
         return image
@@ -750,6 +773,13 @@ def to_rgba(image: np.ndarray):
         print(f'Unable to convert image to RGBA: {ex}')
         return image
 
+def rgb_to_sharp_gray(
+        rgb_image: np.ndarray, 
+        sigma1: float = 0.5, 
+        sigma2: float = 1.0
+        ) -> np.ndarray:
+    return gauss_sharpen(to_gray(rgb_image), sigma1, sigma2)
+
 def rescale(image: np.ndarray, scale: float):
     h, w = image.shape[0:2]
     new_size = int(w * scale), int(h * scale)
@@ -759,17 +789,9 @@ def rescale(image: np.ndarray, scale: float):
         print(f'Unable to rescale image by {scale}: {ex}')
 
 # =============================================================================
-# ASYNC HELPER FUNCTIONS
+# LOADING VIDEO
 # =============================================================================
-async def msg(text: str):
-    await asyncio.sleep(0.1)
-    print(text)
-
-async def load_cards_by_attributes(am: AssetManager):
-    print('loading cards')
-    return am.get_cards_by_attributes(require_icon = True)
-
-async def load_video_frames(filepath: str):
+def load_video_frames(filepath: str):
     if not os.path.exists(filepath):
         return print(f'{filepath} does not exist')
     frames = None
@@ -794,7 +816,6 @@ async def load_video_frames(filepath: str):
             has_data, frames[framecount] = capture.read()
             framecount += 1
             
-        # await asyncio.sleep(SLEEP)
         print(f'Loaded {frame_w} by {frame_h} video containing',
               f'{num_frames} frames in {time.time()-t0:.3f} seconds')
         return frames
@@ -814,8 +835,8 @@ if __name__ == '__main__':
     ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
-    matches = LOOP.run_until_complete(detect_icons(ss_path))
+    matches = Matcher(ss_path).identify_all_images()
     
-    # frames = asyncio.run(load_video_frames(vid_path))
+    # frames = load_video_frames(vid_path)
         
     print(f'Finished in {time.time()-t0:.3f} seconds')

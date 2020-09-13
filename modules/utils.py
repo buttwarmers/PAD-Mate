@@ -48,6 +48,10 @@ def in_box(pt, box, scale: float = 1.0):
 def imread_rgb(filepath: str):
     return cv2.cvtColor(cv2.imread(filepath), cv2.COLOR_BGR2RGB)
 
+def imread_rgba(filepath:str):
+    return cv2.cvtColor(cv2.imread(filepath, cv2.IMREAD_UNCHANGED), 
+                        cv2.COLOR_BGRA2RGBA)
+
 # =============================================================================
 # LOCAL TESTING
 # =============================================================================
