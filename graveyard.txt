@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Sep  7 16:37:34 2020
+
+@author: ElliotYoung
+"""
+
+# =============================================================================
+# CARD TEXT PROCESSING
+# =============================================================================
+    def get_card_info(self):
+        pass
+    
+    def download_card_info(self):
+        pass
+
+    def extract_all_card_info(self):
+        cards_folder = self.dirs['cards']
+        card_filenames = os.listdir(cards_folder)
+        card_filepaths = [os.path.join(cards_folder, n) for n in card_filenames
+                          if n.endswith('.txt')]
+        all_info = {}
+        tot = len(card_filepaths)
+        for i, card_filepath in enumerate(card_filepaths):
+            fname = os.path.basename(card_filepath)
+            print(f'Extracting info for {fname}: {tot-i} remaining...')
+            all_info[i] = self.extract_card_info(card_filepath)
+            
+        self.card_info = pd.DataFrame.from_dict(all_info, orient='index')
+        self.save_card_info()
+        
+    def extract_card_info(self, filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            contents = f.read()
+        sections = contents.split('\n#')
+        stats = sections[0]
+        askill, lskill = None, None
+        if len(sections) >= 3:
+            askill = '#' + sections[1]
+            lskill = '#' + sections[2]
+        elif len(sections) > 1:
+            if 'Stats:' in sections[1]:
+                lskill = '#' + sections[1]
+            else:
+                askill = '#' + sections[1]
+        
+        def extract_stats(stats):
+            card_id = re.search(r'#(\d+) ', stats).groups()[0]
+            name = re.search(r'#\d+ (.*)\n', stats).groups()[0]
+            hp = re.search(r'HP: (\S+) ', stats).groups()[0]
+            atk = re.search(r'ATK: (\S+) ', stats).groups()[0]
+            rcv = re.search(r'RCV: (\S+) ', stats).groups()[0]
+            lb = re.search(r'LB: (\S+)', stats).groups()[0]
+            awks = re.search(r'AWK: (.*)\n', stats).groups()[0]
+            sawks = re.search(r'SAWK: (.*)', stats).groups()[0]
+            
+            awks = [int(a) for a in awks.split(',')] if awks else []
+            sawks = [int(sa) for sa in sawks.split(',')] if sawks else []
+            
+            info = {
+                'CardId': int(card_id),
+                'CardName': name,
+                'HP': int(hp),
+                'ATK': int(atk),
+                'RCV': int(rcv),
+                'LimitBreakPercent': int(lb),
+                'Awakenings': awks,
+                'SuperAwakenings': sawks,
+                }
+            
+            return info
+            
+        def extract_active_skill(askill):
+            if not askill:
+                return {
+                'ActiveSkillId': None,
+                'ActiveSkillType': None,
+                'ActiveSkillTags': None,
+                'ActiveSkillName': None,
+                'ActiveSkillDescription': None,
+                'ActiveSkillTextEN': None,
+                'ActiveSkillTextJP': None,
+                'ActiveSkillTextKR': None
+                }
+            skill_id = re.search(r'# (\d+)\/', askill).groups()[0]
+            skill_tags = re.search(r'Tags: (.*)\n', askill).groups()[0]
+            skill_tags = skill_tags.split(',')
+            skill_type = re.search(r'\/(\d+) ', askill).groups()[0]
+            skill_name = re.search(r'- (.*)\n', askill).groups()[0]
+            description = re.search(r'Game: (.*)\n', askill).groups()[0]
+            en_text = re.search('EN: (.*)\n', askill).groups()[0]
+            jp_text = re.search('JP: (.*)\n', askill).groups()[0]
+            kr_text = re.search('KR: (.*)', askill).groups()[0]
+            
+            askill_info = {
+                'ActiveSkillId': int(skill_id),
+                'ActiveSkillType': int(skill_type),
+                'ActiveSkillTags': skill_tags,
+                'ActiveSkillName': skill_name,
+                'ActiveSkillDescription': description,
+                'ActiveSkillTextEN': en_text,
+                'ActiveSkillTextJP': jp_text,
+                'ActiveSkillTextKR': kr_text
+                }
+            return askill_info
+        
+        def extract_leader_skill(lskill):
+            if not lskill:
+                return {
+                'LeaderSkillId': None,
+                'LeaderSkillType': None,
+                'LeaderSkillTags': None,
+                'LeaderSkillStats': None,
+                'LeaderSkillName': None,
+                'LeaderSkillDescription': None,
+                'LeaderSkillTextEN': None,
+                'LeaderSkillTextJP': None,
+                'LeaderSkillTextKR': None
+                }
+            
+            skill_id = re.search(r'# (\d+)\/', lskill).groups()[0]
+            skill_tags = re.search(r'Tags: (.*)\n', lskill).groups()[0]
+            skill_tags = skill_tags.split(',')
+            skill_stats = re.search(r'Stats: \[(.*)\]', lskill).groups()[0]
+            skill_stats = [float(i) for i in skill_stats.split(', ')]
+            skill_type = re.search(r'\/(\d+) ', lskill).groups()[0]
+            skill_name = re.search(r'- (.*)\n', lskill).groups()[0]
+            description = re.search(r'Game: (.*)\n', lskill).groups()[0]
+            en_text = re.search('EN: (.*)\n', lskill).groups()[0]
+            jp_text = re.search('JP: (.*)\n', lskill).groups()[0]
+            kr_text = re.search('KR: (.*)', lskill).groups()[0]
+            
+            lskill_info = {
+                'LeaderSkillId': int(skill_id),
+                'LeaderSkillType': int(skill_type),
+                'LeaderSkillTags': skill_tags,
+                'LeaderSkillHp': skill_stats[0],
+                'LeaderSkillAtk': skill_stats[1],
+                'LeaderSkillRcv': skill_stats[2],
+                'LeaderSkillShield': skill_stats[3],
+                'LeaderSkillName': skill_name,
+                'LeaderSkillDescription': description,
+                'LeaderSkillTextEN': en_text,
+                'LeaderSkillTextJP': jp_text,
+                'LeaderSkillTextKR': kr_text
+                }
+            return lskill_info
+        
+        stat_info = extract_stats(stats)
+        askill_info = extract_active_skill(askill)
+        lskill_info = extract_leader_skill(lskill)
+        
+        card_info = {}
+        [card_info.update(d) for d in [stat_info, askill_info, lskill_info]]
+        
+        # [print(k, v) for k, v in card_info.items()]
+        
+        return card_info
