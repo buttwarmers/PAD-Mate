@@ -11,8 +11,8 @@ from PIL import Image
 import pandas as pd
 from scipy.ndimage import gaussian_filter
 import concurrent.futures
-from threading import Thread
-from queue import Queue
+# from threading import Thread
+# from queue import Queue
 # import asyncio
 # import nest_asyncio
 # nest_asyncio.apply()
@@ -40,12 +40,10 @@ METHODS = [cv2.TM_CCOEFF, cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR,
 # - TM_SQDIFF requires the minimum value instead of maximum
 # - TM_CCORR is fast but gives more false identifications
 # - TM_CCOEFF is overall the best but is slow
-# using cv2.TM_CCORR_NORMED or cv2.TM_SQDIFF_NORMED generally works based on
-# results of testing at a variety of scales
-PREFERRED_METHOD = cv2.TM_CCOEFF_NORMED
 
-# INTERPOLATION = cv2.INTER_LANCZOS4
-INTERPOLATION = cv2.INTER_CUBIC
+# based on tests, cv2.TM_CCOEFF_NORMED is indeed the most accurate
+PREFERRED_METHOD = cv2.TM_CCOEFF_NORMED
+INTERPOLATION = cv2.INTER_CUBIC # cv2.INTER_LANCZOS4
 LINEWIDTH = 5
 OFFSET_LINEWIDTH = True
 LINECOLOR = (0, 255, 255)
@@ -54,8 +52,8 @@ READ_MODE = cv2.IMREAD_UNCHANGED
 FONT = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 2.5
 SLEEP = 0.0001
-DEFAULT_SCREENSHOT_WIDTH = 800
-DEFAULT_SCALE_WIDTH = 800
+DEFAULT_SCREENSHOT_WIDTH = 750
+DEFAULT_SCALE_WIDTH = 750
 DEBUG = False
 # DEBUG = True
 
@@ -108,7 +106,7 @@ class Matcher():
         return self.raw_input_images
     
     # =============================================================================
-    # CLASS METHODS
+    # STATIC METHODS
     # =============================================================================
     @staticmethod
     def standardize_input_image(image: np.ndarray, rgb: bool = True) -> np.ndarray:
@@ -140,16 +138,33 @@ class Matcher():
         return template
     
     # =============================================================================
+    # CLASS METHODS
+    # =============================================================================
+    @classmethod
+    def trim_image(
+            cls,
+            image: np.ndarray,
+            top: int = 0,
+            bottom: int = 1,
+            left: int = 0,
+            right: int = 1
+            ) -> np.ndarray:
+        try:
+            return image[top:-bottom, left:-right]
+        except:
+            print(f'Could not trim image using {(top, bottom, left, right)}')
+            return image
+    
+    # =============================================================================
     # PROTECTED FUNCTIONS
     # =============================================================================
     @timeit
     def _load_required_assets(self):
         self._load_asset_manager()
-        funcs = (self._load_card_icons, self._load_orb_icons,
-                 self._load_standard_template, self._load_cards_by_attributes)
+        fs = (self._load_card_icons, self._load_orb_icons, self._load_bottom_template,
+              self._load_standard_template, self._load_cards_by_attributes)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            [pool.submit(func) for func in funcs]
-        print('loaded required assets')
+            [pool.submit(f) for f in fs]
             
     def _load_asset_manager(self):
         self.asset_manager = AssetManager()
@@ -164,12 +179,42 @@ class Matcher():
         template = self.asset_manager.load_standard_template()
         self.standard_template = self.standardize_template(template, 1.0)
         
+    def _load_bottom_template(self):
+        template = self.asset_manager.load_template('cards_text_template')
+        self.cards_text_template = self.standardize_template(template, 1.0)
+        
     def _load_cards_by_attributes(self):
         self.cards_by_attributes = self.asset_manager.load_cards_by_attributes()
         
     # =============================================================================
     # SUB-ROUTINES
     # =============================================================================
+    @timeit
+    def find_bottom_boundary(
+            self,
+            input_image: np.ndarray,
+            scale: float
+            ) -> int:
+        
+        # get input dimensions
+        im_h, im_w = input_image.shape[0:2]
+        
+        template = self.cards_text_template
+        if template is None:
+            return print('Unable to get bottom boundary: template missing')
+        
+        # resize the template based on the known scaling factor
+        template = rescale(template, (100/164)*scale)
+        temp_h, temp_w = template.shape[0:2]
+        
+        # get match position
+        match = find_matches(input_image, template)
+        
+        # get position of bottom boundary
+        boundary = im_h - (match['boxes'][0][1] + temp_h)
+        print(f'Bottom boundary: {boundary}')
+        return boundary
+    
     @classmethod
     def find_orbs(
             cls,
@@ -250,22 +295,31 @@ class Matcher():
             input_image: np.ndarray,
             orig_img: np.ndarray,
             attributes: str,
-            bbox: tuple,
+            bboxes: tuple,
             icons: dict, 
             scale: float,
             offsets: tuple,
             crop: bool = True
             ):
         
+        print(f'\nIdentifying {attributes} region...\n')
+        
         # get list of cards to search over
         card_list = self.cards_by_attributes[attributes]
         
-        # get the region
-        (y1, x1), (y2, x2) = bbox
-        region = input_image[x1:x2, y1:y2].copy()
+        # extract all the card regions
+        regions = {((y1, x1), (y2, x2)): input_image[x1:x2, y1:y2]
+                   for ((y1, x1), (y2, x2)) in bboxes}
+        # for bbox in bboxes:
+        #     # get the region
+        #     (y1, x1), (y2, x2) = bbox
+        #     region = input_image[x1:x2, y1:y2] #.copy()
+        #     regions.append(region)
         
-        # compare provided region against all icons with the same attributes
+        # match all the regions
         matched_cards = []
+        unmatched_regions = regions.copy()
+        # compare provided region against all icons with the same attributes
         for card_name in card_list:
             # prepare card icon
             card_icon = icons.get(card_name, None)
@@ -274,25 +328,36 @@ class Matcher():
             card_icon = self.standardize_template(card_icon, scale)
             card_icon = self.crop_icon(card_icon, offsets) if crop else card_icon
             
-            # check for a match
-            result = find_matches(region, card_icon)
-            
-            # don't store info for non-matches
-            if not result['matched']:
-                continue
-            
-            # store match information
-            result['name'] = card_name
-            result['bbox'] = bbox
-            result['offsets'] = offsets
-            matched_cards.append(result)
-            print(f'Matched {card_name}')
-            
-            # show the matched region
-            self.show_matches(orig_img, card_icon, result, True, False)
-            
-            # only match once
-            break
+            # check for a match against all regions
+            for (bbox, region) in regions.items():
+                # return if all regions have been matched
+                if len(unmatched_regions) == 0:
+                    return matched_cards
+                
+                # make sure region hasn't already been matched
+                if bbox not in unmatched_regions.keys():
+                    continue
+                
+                # check for match
+                result = find_matches(region, card_icon)
+                
+                # don't store info for non-matches
+                if not result['matched']:
+                    continue
+                
+                # store match information
+                result['name'] = card_name
+                result['bbox'] = bbox
+                result['offsets'] = offsets
+                matched_cards.append(result)
+                unmatched_regions.pop(bbox)
+                print(f'Matched {card_name}')
+                
+                # show the matched region
+                self.show_matches(orig_img, card_icon, result, True, False)
+                
+                # # only match once
+                # break
         
         if not matched_cards:
             print(f'No match found for predicted {attributes} card')
@@ -302,29 +367,43 @@ class Matcher():
     # =============================================================================
     # DETECTING ICONS
     # =============================================================================
-    # @timeit
+    @timeit
     def detect_icons(
             self,
-            raw_image: np.ndarray,
+            rgb_image: np.ndarray,
             crop: bool = True,
             save_matches: bool = True,
             save_heatmaps: bool = False
             ):
         
         # create a copy of the input to avoid modifying the original
-        img_rgb = self.standardize_input_image(raw_image.copy())
+        img_rgb = self.standardize_input_image(rgb_image.copy())
         
         # preprocess the image for detections
         img = self.standardize_template(img_rgb, 1.0)
 
-        # get optimal rescale factor for matching
+        # get optimal rescale factor for resizing card & orb icons
         if self.default_scale is None:
             std_temp = self.standard_template
-            scale = get_best_scale(img, std_temp)
+            scale, info = get_best_scale(img, std_temp)
             self.default_scale = scale
+            
+            # get the top boundary of the box region
+            _h, _dh = info['boxes'][0][1], info['template_height']
+            box_top_boundary = _h + _dh
+            
         else:
             scale = self.default_scale
             
+        # get the position of the bottom boundary
+        box_bottom_boundary = self.find_bottom_boundary(img, scale)
+            
+        # trim the image to just the monster box so matching is faster
+        img = self.trim_image(img, top = box_top_boundary,
+                              bottom = box_bottom_boundary)
+        img_rgb = self.trim_image(img_rgb, top = box_top_boundary,
+                                  bottom = box_bottom_boundary)
+        
         # make sure icons were loaded
         icons = self.card_icons
         if not icons:
@@ -355,10 +434,9 @@ class Matcher():
         # fix orb icons
         orbs = {k: self.standardize_template(v, scale) for k, v in self.orb_icons.items()}
         orb_h, orb_w = list(orbs.values())[0].shape
-        print(orb_w, orb_h)
         
         # detect orb positions
-        print('\nDetecting attributes...')
+        print('\nDetecting attributes...\n')
         orb_results = {color: matches for (color, matches) in
                         (self.find_orbs(img, orb, color, self.orb_crop_factor) 
                         for color, orb in orbs.items())}
@@ -435,29 +513,33 @@ class Matcher():
             sattr = sattr if sattr else ''
             card_bboxes.append((f'{attr}{sattr}', bbox))
             
-        # report how many cards are predicted
+        # report how many cards are predicted and group bboxes by attributes
         print(f'\n{num_expected_matches} card(s) predicted:')
-        predictions = {c: sum(1 for crd in card_bboxes if crd[0] == c)
+        predictions = {c: [crd[1] for crd in card_bboxes if crd[0] == c]
                        for c in set(p[0] for p in card_bboxes)}
-        [print(f'    {colors}: {num}') for colors, num in predictions.items()]
+        [print(f'    {colors}: {len(cds)}') for colors, cds in predictions.items()]
             
         # save a picture of the predicted card positions
         pairs_path = os.path.abspath('./tests/predicted card positions.png')
         Image.fromarray(pairs_img).save(pairs_path)
         
         # identify regions by comparing to card icons
-        print('\nIdentifying regions...\n')
+        print('\nIdentifying regions...')
         # TODO: skip icon regions that are cut off at top or bottom
-        # matched_cards = await asyncio.gather(*(self.identify_region(
-        #                                         img, img_rgb, attrs, bbox, 
-        #                                         self.cards_by_attributes, icons,
-        #                                         scale, icon_offsets, crop)
-        #                                         for (attrs, bbox) in card_bboxes))
         matched_cards = []
-        for (attrs, bbox) in card_bboxes:
-            matched_cards += self.identify_region(img, img_rgb, attrs, bbox, 
-                                                  icons, scale, icon_offsets, crop)
-                                                      
+        
+        # REGULAR
+        # for attrs, bboxes in predictions.items():
+        #     matched_cards += self.identify_region(img, img_rgb, attrs, bboxes, 
+        #                                           icons, scale, icon_offsets, crop)
+        
+        # MULTIPROCESSING
+        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(self.identify_region, img, img_rgb, attrs, bboxes,
+                                    icons, scale, icon_offsets, crop) 
+                        for (attrs, bboxes) in predictions.items()]
+            for future in concurrent.futures.as_completed(futures):
+                matched_cards += future.result()
         
         # update the list of all matched cards
         self.matched_cards.append(matched_cards)
@@ -511,7 +593,7 @@ def evaluate_scale(
     
     return (scale, result)
 
-# @timeit
+@timeit
 def get_best_scale(
         input_image: np.ndarray, 
         template: np.ndarray,
@@ -566,36 +648,33 @@ def get_best_scale(
     results = {res[0]: res[1] for res in [evaluate_scale(img, template, scale)
                                           for scale in scales]}
     
+    # get the scale associated with the highest confidence value
     best_scale = sorted([(scale, res['confidence']) for scale, res in results.items()],
                         key = lambda i: i[1])[-1][0]
-    
-    # get the scale associated with the highest confidence result
-    # df = pd.DataFrame.from_dict(results, orient='index')
-    # df.sort_values(by='confidence', inplace=True, ascending=False)
-    # confidence = df['confidence'].values[0]
-    # best_scale = df['scale'].values[0]
     
     # remove the downscaling factor
     best_scale /= downscale
     
-    # # for debugging purposes
-    # if DEBUG:
-    #     boxes = df['boxes'].values[0]
-    #     size = df['dimensions'].values[0]
-        
-    #     print(df[['scale', 'matched', 'confidence', 'dimensions']].head(10))
-    #     print(f'Best scale: {best_scale:.3f}')
-    #     print(f'Confidence: {confidence:.3f}')
-    
-    #     w, h = size
-    #     for box in boxes:
-    #         cv2.rectangle(img, box, (box[0] + w, box[1] + h), LINECOLOR, LINEWIDTH)
-        
-    #     save_path = os.path.abspath(f'./tests/optimized scale {best_scale:.2f}.png')
-    #     Image.fromarray(img).save(save_path)
-    
+    # for debugging purposes
+    if DEBUG:
+        # get the scale associated with the highest confidence result
+        df = pd.DataFrame.from_dict(results, orient='index')
+        df.sort_values(by='confidence', inplace=True, ascending=False)
+        confidence = df['confidence'].values[0]
+        best_scale = df['scale'].values[0]
+        boxes = df['boxes'].values[0]
+        size = df['dimensions'].values[0]
+        print(df[['scale', 'matched', 'confidence', 'dimensions']].head(10))
+        print(f'Best scale: {best_scale:.3f}')
+        print(f'Confidence: {confidence:.3f}')
+        w, h = size
+        for box in boxes:
+            cv2.rectangle(img, box, (box[0] + w, box[1] + h), LINECOLOR, LINEWIDTH)
+        save_path = os.path.abspath(f'./tests/optimized scale {best_scale:.2f}.png')
+        Image.fromarray(img).save(save_path)
+
     print(f'Best scale: {best_scale:.3f}')
-    return best_scale
+    return best_scale, results[best_scale]
 
 # =============================================================================
 # GENERAL MATCHING FUNCTION
@@ -653,11 +732,11 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     
     # refine to exclude bad matches
     if PREFERRED_METHOD == cv2.TM_SQDIFF_NORMED:
-        min_confidence = 0.80
+        min_confidence = 0.80 
     elif PREFERRED_METHOD == cv2.TM_CCORR_NORMED:
         min_confidence = 0.80
     elif PREFERRED_METHOD == cv2.TM_CCOEFF_NORMED:
-        min_confidence = 0.45
+        min_confidence = 0.45 # 0.45 default
     else:
         min_confidence = 0.60
     
@@ -670,14 +749,7 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     
     # return early if there are way too many matches
     if len(loc[0]) > 1000:
-        # TODO
-        # # only get the best box
-        # loc = np.where(res == np.amax(res))
-        # # boxes = list(zip(*loc[::-1]))
-        # num_matches = len(loc[0])
-        # if num_matches > 100:
-        #     # boxes = zip(*loc[0, 0, -1])
-        #     boxes = []
+        # TODO get the n best matches
         return {
             'matched': False,
             'num_matches': len(loc[0]),
