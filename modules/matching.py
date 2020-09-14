@@ -43,7 +43,10 @@ METHODS = [cv2.TM_CCOEFF, cv2.TM_CCOEFF_NORMED, cv2.TM_CCORR,
 
 # based on tests, cv2.TM_CCOEFF_NORMED is indeed the most accurate
 PREFERRED_METHOD = cv2.TM_CCOEFF_NORMED
-INTERPOLATION = cv2.INTER_CUBIC # cv2.INTER_LANCZOS4
+
+# cv2.INTER_LANCZOS4 is the most accurate interpolation
+INTERPOLATION = cv2.INTER_LANCZOS4 # cv2.INTER_CUBIC
+
 LINEWIDTH = 5
 OFFSET_LINEWIDTH = True
 LINECOLOR = (0, 255, 255)
@@ -52,8 +55,8 @@ READ_MODE = cv2.IMREAD_UNCHANGED
 FONT = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 2.5
 SLEEP = 0.0001
-DEFAULT_SCREENSHOT_WIDTH = 750
-DEFAULT_SCALE_WIDTH = 750
+DEFAULT_SCREENSHOT_WIDTH = 1000 # minimum size to still detect orbs consistently
+DEFAULT_SCALE_WIDTH = 1000
 DEBUG = False
 # DEBUG = True
 
@@ -65,7 +68,7 @@ class Matcher():
             self, 
             input_images: list,
             default_scale: float = None,
-            orb_crop_factor: float = 0.15,
+            orb_crop_factor: float = 0.15, # 0.15 default
             **kwargs
             ) -> dict:
         
@@ -118,9 +121,11 @@ class Matcher():
     
     @staticmethod
     def crop_orb(orb: np.ndarray, crop_factor: float = 0.15) -> np.ndarray:
+        if crop_factor == 0.0:
+            return orb
         h, w = orb.shape[0:2]
         dh, dw = int(crop_factor * h), int(crop_factor * w)
-        return orb[dh:-dh, dw:-dw]
+        return orb[dh:min(-dh, -1), dw:min(-dw, -1)]
     
     @staticmethod
     def crop_icon(icon: np.ndarray, offsets: tuple) -> np.ndarray:
@@ -154,7 +159,7 @@ class Matcher():
         except:
             print(f'Could not trim image using {(top, bottom, left, right)}')
             return image
-    
+        
     # =============================================================================
     # PROTECTED FUNCTIONS
     # =============================================================================
@@ -162,7 +167,8 @@ class Matcher():
     def _load_required_assets(self):
         self._load_asset_manager()
         fs = (self._load_card_icons, self._load_orb_icons, self._load_bottom_template,
-              self._load_standard_template, self._load_cards_by_attributes)
+              self._load_standard_template, self._load_scrollbar_template, 
+              self._load_cards_by_attributes)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             [pool.submit(f) for f in fs]
             
@@ -183,6 +189,12 @@ class Matcher():
         template = self.asset_manager.load_template('cards_text_template')
         self.cards_text_template = self.standardize_template(template, 1.0)
         
+    def _load_scrollbar_template(self):
+        template = self.asset_manager.load_template('scrollbar_template')
+        # don't do preprocessing on scrollbar - works better this way
+        # self.scrollbar_template = self.standardize_template(template, 1.0)
+        self.scrollbar_template = template
+        
     def _load_cards_by_attributes(self):
         self.cards_by_attributes = self.asset_manager.load_cards_by_attributes()
         
@@ -201,7 +213,7 @@ class Matcher():
         
         template = self.cards_text_template
         if template is None:
-            return print('Unable to get bottom boundary: template missing')
+            return print('Unable to get bottom boundary: missing template')
         
         # resize the template based on the known scaling factor
         template = rescale(template, (100/164)*scale)
@@ -209,12 +221,53 @@ class Matcher():
         
         # get match position
         match = find_matches(input_image, template)
+        if not match['matched']:
+            print('Unable to get bottom boundary: no match found')
+            return 1
         
         # get position of bottom boundary
         boundary = im_h - (match['boxes'][0][1] + temp_h)
         print(f'Bottom boundary: {boundary}')
         return boundary
     
+    @timeit
+    def get_scrollbar_position(
+            self,
+            input_image: np.ndarray,
+            scale: float
+            ) -> tuple:
+        
+        # get the scrollbar template
+        template = self.scrollbar_template
+        if template is None:
+            return print('Unable to get scrollbar position: missing template')
+        
+        # resize template based on known scaling factor
+        template = rescale(template, (100/164)*scale) # 100 / 164
+        temp_h, temp_w = template.shape[0:2]
+        
+        # get match position
+        match = find_matches(input_image, template)
+        match['name'] = 'scrollbar'
+        if not match['matched']:
+            return print('Unable to get scrollbar position: no match found')
+        
+        # show the bounding region
+        box = match['boxes'][0]
+        tl_x, tl_y = box
+        br_x, br_y = tl_x + temp_w, tl_y + temp_h
+        match['bbox'] = (tl_x, tl_y), (tl_x + temp_w, tl_y + temp_h)
+        
+        # show the region
+        scroll_region = input_image[tl_y:br_y, tl_x:br_x]
+        # Image.fromarray(scroll_region).show()
+        self.show_matches(input_image, template, match, show_full_box=False, save_heatmap=True)
+        
+        # get position of scrollbar within the region
+                
+        
+        return match
+        
     @classmethod
     def find_orbs(
             cls,
@@ -259,36 +312,42 @@ class Matcher():
                         (0, 255, 255), 3, cv2.LINE_AA)
         
         # check if bounding box already exists
+        (dw0, dw1), (dh0, dh1) = offsets
+        lw = LINEWIDTH if OFFSET_LINEWIDTH else 0
+        h, w = template.shape[0:2]
+        match_boxes = []
         if 'bbox' in matches.keys():
             start, end = matches['bbox']
-            label_img(img, start, end)
+            start = (start[0] - lw), (start[1] + lw)
+            end = (end[0] - lw), (end[1] + lw)
+            match_boxes.append((start, end))
         
         # otherwise, create bounding boxes for display
         else:
-            h, w = template.shape[0:2]
             boxes = matches['boxes']
-            lw = LINEWIDTH if OFFSET_LINEWIDTH else 0
             for box in boxes:
                 # expand the box to account for line width and initial crop
-                (dw0, dw1), (dh0, dh1) = offsets
-                if show_full_box:
-                    start = (box[0] - dw0 - lw, box[1] - dh0 - lw)
-                    end = (box[0] + w + dw1 + lw, box[1] + h + dh1 + lw)
-                else:
-                    start = (box[0] - lw, box[1] - lw)
-                    end = (box[0] + w + lw, box[1] + h + lw)
-                label_img(img, start, end)
+                start = (box[0] - lw, box[1] - lw)
+                end = (box[0] + w + lw, box[1] + h + lw)
+                match_boxes.append((start, end))
+        
+        # expand box
+        for (start, end) in match_boxes:
+            if show_full_box or True:
+                start = (start[0] + dw0, start[1] + dh0)
+                end = (end[0] - dw1, end[1] - dh1)
+            label_img(img, start, end)
         
         # save result image
         match_path = os.path.abspath(f'./tests/{name}.png')
-        Image.fromarray(img).save(match_path)
+        save_rgb(img, match_path)
             
         # save heatmap
         confidence_map = matches.get('confidence_map', None)
         if save_heatmap and confidence_map is not None:
             heatmap_path = os.path.abspath(f'./tests/{name}_map.png')
             normalized = confidence_map*(255*np.amax(confidence_map))
-            Image.fromarray(normalized).save(heatmap_path)
+            save_rgb(normalized, heatmap_path)
 
     def identify_region(
             self,
@@ -302,19 +361,20 @@ class Matcher():
             crop: bool = True
             ):
         
+        if len(bboxes) == 0:
+            print(f'\nNo {attributes} regions identified...\n')
+            return [], {}
+        
         print(f'\nIdentifying {attributes} region...\n')
         
         # get list of cards to search over
         card_list = self.cards_by_attributes[attributes]
         
         # extract all the card regions
-        regions = {((y1, x1), (y2, x2)): input_image[x1:x2, y1:y2]
-                   for ((y1, x1), (y2, x2)) in bboxes}
-        # for bbox in bboxes:
-        #     # get the region
-        #     (y1, x1), (y2, x2) = bbox
-        #     region = input_image[x1:x2, y1:y2] #.copy()
-        #     regions.append(region)
+        # regions = {((y1, x1), (y2, x2)): input_image[x1:x2, y1:y2]
+        #            for ((y1, x1), (y2, x2)) in bboxes}
+        regions = {bbox: extract_region(input_image, bbox)
+                   for bbox in bboxes}
         
         # match all the regions
         matched_cards = []
@@ -332,7 +392,7 @@ class Matcher():
             for (bbox, region) in regions.items():
                 # return if all regions have been matched
                 if len(unmatched_regions) == 0:
-                    return matched_cards
+                    return matched_cards, unmatched_regions
                 
                 # make sure region hasn't already been matched
                 if bbox not in unmatched_regions.keys():
@@ -345,7 +405,12 @@ class Matcher():
                 if not result['matched']:
                     continue
                 
+                # if attributes == 'gr':
+                #     Image.fromarray(region).show()
+                #     Image.fromarray(card_icon).show()
+                
                 # store match information
+                # concurrent.futures has trouble with special characters
                 result['name'] = card_name
                 result['bbox'] = bbox
                 result['offsets'] = offsets
@@ -355,14 +420,11 @@ class Matcher():
                 
                 # show the matched region
                 self.show_matches(orig_img, card_icon, result, True, False)
-                
-                # # only match once
-                # break
         
         if not matched_cards:
             print(f'No match found for predicted {attributes} card')
             
-        return matched_cards  
+        return matched_cards, unmatched_regions
 
     # =============================================================================
     # DETECTING ICONS
@@ -404,6 +466,9 @@ class Matcher():
         img_rgb = self.trim_image(img_rgb, top = box_top_boundary,
                                   bottom = box_bottom_boundary)
         
+        # get scrollbar position
+        scroll = self.get_scrollbar_position(img_rgb, scale)
+        
         # make sure icons were loaded
         icons = self.card_icons
         if not icons:
@@ -415,13 +480,14 @@ class Matcher():
         
         # get new dimensions based on optimal rescale factor
         new_w, new_h = (int(scale*orig_w), int(scale*orig_h))
+        print(f'Icon dimensions: ({new_w}, {new_h})')
         
         # get crop factor for icons - crop to exclude plusses, level, etc.
         if crop:
-            dh0 = int(0.45 * new_h) # top offset
-            dh1 = int(0.30 * new_h) # bottom offset
-            dw0 = int(0.15 * new_w) # left offset
-            dw1 = int(0.15 * new_w) # right offset
+            dh0 = int(0.45 * new_h) # top offset ; 0.45 default
+            dh1 = int(0.30 * new_h) # bottom offset ; 0.30 default
+            dw0 = int(0.15 * new_w) # left offset ; 0.15 default
+            dw1 = int(0.15 * new_w) # right offset ; 0.15 default
         else:
             dh0 = dh1 = dw0 = dw1 = int(0.1 * new_h)
             
@@ -430,10 +496,11 @@ class Matcher():
         dh0, dh1 = (0, 1) if (dh0 + dh1) >= new_h else (dh0, dh1)
         dw0, dw1 = (0, 1) if (dw0 + dw1) >= new_w else (dw0, dw1)
         icon_offsets = ((dw0, dw1), (dh0, dh1))
+        print(f'Icon offsets: {icon_offsets}')
         
         # fix orb icons
         orbs = {k: self.standardize_template(v, scale) for k, v in self.orb_icons.items()}
-        orb_h, orb_w = list(orbs.values())[0].shape
+        orb_h, orb_w = list(orbs.values())[0].shape[0:2]
         
         # detect orb positions
         print('\nDetecting attributes...\n')
@@ -468,7 +535,15 @@ class Matcher():
             x2 = pos_2[0] + orb_w + orb_offset_w
             y2 = pos_2[1] + orb_h + orb_offset_h
             dx, dy = x2 - x1, y2 - y1
-            return (abs(dx - new_w) < 10) and (abs(dy - new_h) < 10)
+            return (abs(dx - new_w) < 15) and (abs(dy - new_h) < 15) # < 10 default
+        
+        # for checking if lefover orbs are actually single attribute cards or not
+        def not_single(orb_1, orb_2):
+            different = (orb_1 != orb_2)
+            staggered = abs(orb_1[0] - orb_2[0]) > orb_w
+            above = (orb_1[1] - orb_2[1]) < 0
+            close = (pt_sep(orb_1, orb_2) < new_h)
+            return staggered and above and close and different
         
         # get dual attribute cards
         classified_orbs = []
@@ -484,9 +559,11 @@ class Matcher():
                     dual_attr.append((orb_1, orb_2))
                     classified_orbs += [orb_1, orb_2]
            
-        # get single attribute cards
+        # get single attribute cards - must not have any other orbs nearby
+        not_classified = [orb for orb in orb_positions if orb not in classified_orbs]
         single_attr = [(orb, (None, (None, None))) for orb in orb_positions 
-                       if orb not in classified_orbs]
+                       if orb not in classified_orbs and not any(
+                       not_single(orb[1], orb2[1]) for orb2 in not_classified)]
         
         # combine the two to get all predicted card locations and attributes
         predicted_cards = dual_attr + single_attr
@@ -502,8 +579,8 @@ class Matcher():
                 br_x = br[0] + orb_w + orb_offset_w + LINEWIDTH
                 br_y = br[1] + orb_h + orb_offset_h + LINEWIDTH
             else:
-                br_x = tl_x + new_w
-                br_y = tl_y + new_h
+                br_x = tl_x + new_w + LINEWIDTH
+                br_y = tl_y + new_h + LINEWIDTH
             top_left = (tl_x, tl_y)
             bottom_right = (br_x, br_y)
             cv2.rectangle(pairs_img, top_left, bottom_right, LINECOLOR, LINEWIDTH)
@@ -521,25 +598,30 @@ class Matcher():
             
         # save a picture of the predicted card positions
         pairs_path = os.path.abspath('./tests/predicted card positions.png')
-        Image.fromarray(pairs_img).save(pairs_path)
+        save_rgb(pairs_img, pairs_path)
         
         # identify regions by comparing to card icons
         print('\nIdentifying regions...')
         # TODO: skip icon regions that are cut off at top or bottom
         matched_cards = []
+        unmatched_cards = {}
         
         # REGULAR
-        # for attrs, bboxes in predictions.items():
-        #     matched_cards += self.identify_region(img, img_rgb, attrs, bboxes, 
-        #                                           icons, scale, icon_offsets, crop)
+        for attrs, bboxes in predictions.items():
+            matched, unmatched = self.identify_region(img, img_rgb, attrs, bboxes, 
+                                                      icons, scale, icon_offsets, crop)
+            matched_cards += matched
+            unmatched_cards[attrs] = unmatched
+            
+        # TODO: something with the unmatched cards? prompt user to ID manually?
         
         # MULTIPROCESSING
-        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
-            futures = [pool.submit(self.identify_region, img, img_rgb, attrs, bboxes,
-                                    icons, scale, icon_offsets, crop) 
-                        for (attrs, bboxes) in predictions.items()]
-            for future in concurrent.futures.as_completed(futures):
-                matched_cards += future.result()
+        # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
+        #     futures = [pool.submit(self.identify_region, img, img_rgb, attrs, bboxes,
+        #                             icons, scale, icon_offsets, crop) 
+        #                 for (attrs, bboxes) in predictions.items()]
+        #     for future in concurrent.futures.as_completed(futures):
+        #         matched_cards += future.result()
         
         # update the list of all matched cards
         self.matched_cards.append(matched_cards)
@@ -555,6 +637,7 @@ class Matcher():
                     continue
                 print(f'    {category}:   {value}')
             print('\n')
+            
         return matched_cards
     
     def identify_all_images(self):
@@ -573,7 +656,7 @@ def evaluate_scale(
         scale: float
         ) -> tuple:
     
-    print(f'Checking scale {scale:.3f}')
+    # print(f'Checking scale {scale:.3f}')
     
     # rescale the template
     img_h, img_w = input_image.shape[0:2]
@@ -588,8 +671,8 @@ def evaluate_scale(
     result['scale'] = scale
     result['dimensions'] = new_size
     
-    confidence = result['confidence']
-    print(f'Confidence: {confidence}')
+    # confidence = result['confidence']
+    # print(f'Confidence: {confidence}')
     
     return (scale, result)
 
@@ -627,10 +710,6 @@ def get_best_scale(
     orig_h, orig_w = int(mult * template.shape[0]), int(mult * template.shape[1])
     template = cv2.resize(template, (orig_w, orig_h), interpolation=INTERPOLATION)
     print(f'Original template height: {orig_h}\nOriginal template width: {orig_w}')
-    
-    # image processing on the template
-    # template = to_gray(template)
-    # template = gauss_sharpen(template)
     
     # define minimum width based on fact that template should be at least 1/3
     # of the width of the original image (can change if matching template changes)
@@ -671,7 +750,7 @@ def get_best_scale(
         for box in boxes:
             cv2.rectangle(img, box, (box[0] + w, box[1] + h), LINECOLOR, LINEWIDTH)
         save_path = os.path.abspath(f'./tests/optimized scale {best_scale:.2f}.png')
-        Image.fromarray(img).save(save_path)
+        save_rgb(img, save_path)
 
     print(f'Best scale: {best_scale:.3f}')
     return best_scale, results[best_scale]
@@ -693,8 +772,8 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     template = to_gray(template)
     
     # make sure the template isn't too big
-    temp_h, temp_w = template.shape
-    img_h, img_w = input_image.shape
+    temp_h, temp_w = template.shape[0:2]
+    img_h, img_w = input_image.shape[0:2]
     if temp_h >= img_h or temp_w >= img_w:
         if temp_h >= img_h:
             old_h = temp_h
@@ -704,7 +783,10 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
             old_w = temp_w
             temp_w = img_w - 1
             temp_h = int((temp_w/old_w) * temp_h)
-        template = cv2.resize(template, (temp_w, temp_h), PREFERRED_METHOD)
+        try:
+            template = cv2.resize(template, (temp_w, temp_h), PREFERRED_METHOD)
+        except:
+            print(f'Unable to resize template to {(temp_w, temp_h)}')
     
     # get matches
     try:
@@ -744,7 +826,7 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     res = orig_res
     
     # get locations of bounding boxes
-    threshold = max(min_confidence, np.percentile(res, 99.99))
+    threshold = max(min_confidence, np.percentile(res, 99.99)) # 99.99
     loc = np.where(res >= threshold)
     
     # return early if there are way too many matches
@@ -765,9 +847,12 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
     
     # filter results that are nearby
     boxes = []
-    min_sep = orig_res.shape[1] / 8
-    [boxes.append(pt) for pt in pts if not 
-     any(pt_sep(pt, box) < min_sep for box in boxes)]
+    min_sep = template.shape[1] / 3
+    for pt in pts:
+        if not any(pt_sep(pt, box) < min_sep for box in boxes):
+            boxes.append(pt)
+    # [boxes.append(pt) for pt in pts if not 
+     # any(pt_sep(pt, box) < min_sep for box in boxes)]
     
     # get number of matches
     num_matches = len(boxes)
@@ -804,14 +889,18 @@ def to_numpy(image):
         return image
 
 def to_gray(image: np.ndarray) -> np.ndarray:
-    if image.ndim == 2:
-        return image
-    elif image.ndim == 3 and image.shape[2] == 3:
-        return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    elif image.ndim == 3 and image.shape[2] == 4:
-        return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
-    else:
-        print('Could not convert image to grayscale')
+    try:
+        if image.ndim == 2:
+            return image
+        elif image.ndim == 3 and image.shape[2] == 3:
+            return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            return cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+        else:
+            print('Could not convert image to grayscale')
+            return image
+    except Exception as ex:
+        print(f'Unable to convert to grayscale: {ex}')
         return image
     
 def to_rgb(image: np.ndarray):
@@ -859,6 +948,23 @@ def rescale(image: np.ndarray, scale: float):
         return cv2.resize(image, new_size, interpolation=INTERPOLATION)
     except Exception as ex:
         print(f'Unable to rescale image by {scale}: {ex}')
+        
+def save_rgb(image: np.ndarray, path: str):
+    try:
+        if image.ndim == 3:
+            cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+        elif image.ndim == 2:
+            cv2.imwrite(path, image)
+        elif image.ndim == 4:
+            cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGBA2BGRA))
+    except Exception as ex:
+        return print(f'Unable to save to {path}:\n{ex}')
+    
+def extract_region(image: np.ndarray, bbox: tuple, pad: int = 0) -> np.ndarray:
+    ((y1, x1), (y2, x2)) = bbox
+    pad = int(pad*y1) if (0 < abs(pad) < 1) else pad
+    region = image[(x1-pad):(x2+pad), (y1-pad):(y2+pad)]
+    return region
 
 # =============================================================================
 # LOADING VIDEO
@@ -904,7 +1010,8 @@ if __name__ == '__main__':
     t0 = time.time()
     
     os.chdir(os.path.dirname(__file__))
-    ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
+    ss_path = os.path.abspath('../assets/screenshots/box_test_scrolled.png')
+    # ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
     matches = Matcher(ss_path).identify_all_images()
@@ -912,3 +1019,15 @@ if __name__ == '__main__':
     # frames = load_video_frames(vid_path)
         
     print(f'Finished in {time.time()-t0:.3f} seconds')
+
+# =============================================================================
+# TODO LIST
+# =============================================================================
+'''
+    - Store monster list
+    - Read from videos
+    - Integrate with interface
+    - Accept manual override grade (either add new or reject)
+
+
+'''
