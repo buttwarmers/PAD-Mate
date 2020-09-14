@@ -487,6 +487,17 @@ class AssetManager():
         return self.generate_empty_icon(attr, sattr)
     
     @staticmethod
+    def load_template(name: str) -> np.ndarray:
+        dirs = AssetManager.get_folders()
+        filepath = os.path.join(dirs['feature_templates'], f'{name}.png')
+        if not os.path.exists(filepath):
+            return print(f'{filepath} does not exist')
+        try:
+            return imread_rgba(filepath)
+        except Exception as ex:
+            return print(f'Could not load {name} from {filepath}\n{ex}')
+    
+    @staticmethod
     def load_standard_template():
         dirs = AssetManager.get_folders()
         filepath = os.path.join(dirs['feature_templates'], 'standard_template.png')
