@@ -11,6 +11,7 @@ from PIL import Image
 import pandas as pd
 from scipy.ndimage import gaussian_filter
 import concurrent.futures
+import math
 # from threading import Thread
 # from queue import Queue
 # import asyncio
@@ -55,8 +56,9 @@ READ_MODE = cv2.IMREAD_UNCHANGED
 FONT = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 2.5
 SLEEP = 0.0001
-DEFAULT_SCREENSHOT_WIDTH = 1000 # minimum size to still detect orbs consistently
-DEFAULT_SCALE_WIDTH = 1000
+DEFAULT_SCREENSHOT_WIDTH = 750 # minimum size to still detect orbs consistently
+DEFAULT_SCALE_WIDTH = DEFAULT_SCREENSHOT_WIDTH
+NO_PEEK = False
 DEBUG = False
 # DEBUG = True
 
@@ -80,33 +82,40 @@ class Matcher():
         self.orb_crop_factor = orb_crop_factor
         
         # store empty variables
-        self.raw_input_images = []
+        self.rgb_input_images = []
         self.matched_images = []
         self.matched_cards = []
+        self.input_videos = {}
+        self.box_bottom_boundary = None
+        self.box_top_boundary = None
         
         # parse the input images
         self.rgb_input_images = self.add_inputs(input_images)
         self.num_input_images = len(self.rgb_input_images)
-        if self.num_input_images == 0:
+        if self.num_input_images == 0 and len(self.input_videos) == 0:
             return print('No input images provided')
-        print(f'Got {self.num_input_images} input images')
+        print(f'Got {self.num_input_images} input images',
+              f'and {len(self.input_videos)} videos')
         
         # initialize the asset manager and load required assets
         self._load_required_assets()
         
     def add_inputs(self, inputs: list):
         inputs = [inputs] if not isinstance(inputs, list) else inputs
+        vid_exts = ('.mp4', 'mp3', '.gif', '.mkv', '.mov', '.webm', '.avi', '.ogg')
         for item in inputs:
             if isinstance(item, str):
                 if not os.path.exists(item):
                     print(f'{item} does not exist')
                     continue
-                # img = cv2.imread(item, cv2.IMREAD_UNCHANGED)
+                elif item.lower().endswith(vid_exts):
+                    self.input_videos[item] = None
+                    continue
                 img = imread_rgb(item)
-                # TODO: handle URLs and videos
+                # TODO: handle URLs
             img = to_numpy(img)
-            self.raw_input_images.append(img) if img is not None else None
-        return self.raw_input_images
+            self.rgb_input_images.append(img) if img is not None else None
+        return self.rgb_input_images
     
     # =============================================================================
     # STATIC METHODS
@@ -191,9 +200,8 @@ class Matcher():
         
     def _load_scrollbar_template(self):
         template = self.asset_manager.load_template('scrollbar_template')
-        # don't do preprocessing on scrollbar - works better this way
-        # self.scrollbar_template = self.standardize_template(template, 1.0)
-        self.scrollbar_template = template
+        # load scrollbar as grayscale instead of standard template processing
+        self.scrollbar_template = to_gray(template)
         
     def _load_cards_by_attributes(self):
         self.cards_by_attributes = self.asset_manager.load_cards_by_attributes()
@@ -242,6 +250,10 @@ class Matcher():
         if template is None:
             return print('Unable to get scrollbar position: missing template')
         
+        # convert inputs to grayscale
+        template = to_gray(template)
+        input_image = to_gray(input_image)
+        
         # resize template based on known scaling factor
         template = rescale(template, (100/164)*scale) # 100 / 164
         temp_h, temp_w = template.shape[0:2]
@@ -260,14 +272,103 @@ class Matcher():
         
         # show the region
         scroll_region = input_image[tl_y:br_y, tl_x:br_x]
-        # Image.fromarray(scroll_region).show()
-        self.show_matches(input_image, template, match, show_full_box=False, save_heatmap=True)
+        # self.show_matches(input_image, template, match, show_full_box=False, save_heatmap=True)
         
-        # get position of scrollbar within the region
-                
+        # analyze the scrollbar region
+        return self.analyze_scrollbar(scroll_region)
         
-        return match
+    def analyze_scrollbar(
+            self,
+            scrollbar: np.ndarray,
+            ) -> int:
         
+        # isolate scrollbar from background via gaussian blur subtraction
+        no_bg = scrollbar - gaussian_filter(scrollbar, 25)
+        
+        # get top/bottom of whole scrollbar
+        coords = np.where(no_bg < 175)
+        scroll_top, scroll_bot = max(coords[0]), min(coords[0])
+        
+        # trim input image to just the scrollbar
+        trimmed = scrollbar[scroll_bot:scroll_top, :]
+        
+        # get scrollbar dimensions
+        scroll_h, scroll_w = scrollbar.shape[0:2]
+        
+        # get coordinates of handle pixels (white pixels > 175)
+        # this value is based on a histogram of the standard template
+        active = np.where(trimmed > 175)
+        
+        # get position of the middle of the handle relative to scrollbar
+        h_vals = active[0]
+        bot, top = max(h_vals), min(h_vals)
+        mid = (bot + top) / 2
+        handle_height = abs(top - bot)
+        
+        # get approximate page that the current screen is on
+        # rows per page: 46 rows in a box -> 164px handle, 1141px scroll
+        # this is true for the Galaxy S10+, will not be exact for others
+        rows_per_page = (scroll_h / self.icon_h) * 0.875
+        total_pages = scroll_h / handle_height
+        total_rows = int(total_pages * rows_per_page)
+        
+        # get approximate page number
+        page_num = bot / handle_height
+        
+        # get index of top and bottom card row (one-indexed)
+        bot_partial_row = (rows_per_page * page_num)
+        top_partial_row = (rows_per_page * page_num) - (rows_per_page - 1)
+        
+        # check if top or bottom rows are cut off (based on calculations)
+        cutoff_bot = ((((bot_partial_row % 1) < 0.05) or ((bot_partial_row % 1 > 0.20)))
+                      and (bot_partial_row > math.floor(rows_per_page)))
+        cutoff_top = ((top_partial_row % 1) > 0.20) and (top_partial_row > 2)
+        
+        # get the top / bottom FULL row
+        bot_full_row = (math.floor(bot_partial_row) if cutoff_bot 
+                        else math.ceil(bot_partial_row))
+        top_full_row = (math.ceil(top_partial_row) if cutoff_top 
+                        else math.floor(top_partial_row))
+        
+        # calculate minimum number of cards in box: 
+        min_cards = 4 + 5*(total_rows - 2) + 1
+        max_cards = min_cards + 5
+        num_cards = (min_cards, max_cards)
+        
+        print(f'Scrollbar height: {scroll_h}')
+        print(f'Handle height: {handle_height}')
+        print(f'Estimated page #: {page_num}')
+        print(f'Estimated number of rows: {total_rows}')
+        print(f'Estimated cards in box: {num_cards}')
+        print(f'Bottom partial row: {bot_partial_row}')
+        print(f'Top partial row: {top_partial_row}')
+        print(f'Bottom full row: {bot_full_row}')
+        print(f'Top full row: {top_full_row}')
+        print(f'Is bottom row of cards cut off? {cutoff_bot}')
+        print(f'Is top row of cards cut off? {cutoff_top}')
+        
+        scrollbar_info = {
+            'scroll_w': scroll_w,
+            'scroll_h': scroll_h,
+            'bot': bot,
+            'mid': mid,
+            'top': top,
+            'handle_height': handle_height,
+            'rows_per_page': rows_per_page,
+            'total_pages': total_pages,
+            'total_rows': total_rows,
+            'bot_partial_row': bot_partial_row,
+            'top_partial_row': top_partial_row,
+            'bot_full_row': bot_full_row,
+            'top_full_row': top_full_row,
+            'cutoff_bot': cutoff_bot,
+            'cutoff_top': cutoff_top,
+            'min_cards': min_cards,
+            'max_cards': max_cards,
+            }
+        
+        return scrollbar_info
+    
     @classmethod
     def find_orbs(
             cls,
@@ -294,7 +395,7 @@ class Matcher():
             input_image: np.ndarray, 
             template: np.ndarray, 
             matches: dict,
-            show_full_box: bool = True,
+            show_cropped: bool = True,
             save_heatmap: bool = False
             ):
         
@@ -333,7 +434,7 @@ class Matcher():
         
         # expand box
         for (start, end) in match_boxes:
-            if show_full_box or True:
+            if show_cropped:
                 start = (start[0] + dw0, start[1] + dh0)
                 end = (end[0] - dw1, end[1] - dh1)
             label_img(img, start, end)
@@ -371,8 +472,6 @@ class Matcher():
         card_list = self.cards_by_attributes[attributes]
         
         # extract all the card regions
-        # regions = {((y1, x1), (y2, x2)): input_image[x1:x2, y1:y2]
-        #            for ((y1, x1), (y2, x2)) in bboxes}
         regions = {bbox: extract_region(input_image, bbox)
                    for bbox in bboxes}
         
@@ -419,7 +518,8 @@ class Matcher():
                 print(f'Matched {card_name}')
                 
                 # show the matched region
-                self.show_matches(orig_img, card_icon, result, True, False)
+                self.show_matches(orig_img, card_icon, result, 
+                                  show_cropped=False, save_heatmap=False)
         
         if not matched_cards:
             print(f'No match found for predicted {attributes} card')
@@ -427,16 +527,50 @@ class Matcher():
         return matched_cards, unmatched_regions
 
     # =============================================================================
+    # GETTING BEST VIDEO FRAMES
+    # =============================================================================
+    @timeit
+    def identify_video(
+            self,
+            video_filepath: str,
+            ) -> list:
+        
+        # load video info
+        frames = self.input_videos.get(video_filepath, None)
+        if frames is None:
+            frames = load_video_frames(video_filepath)
+            self.input_videos[video_filepath] = frames
+            if frames is None:
+                return
+        
+        num_frames = frames.shape[0]
+        print(f'Number of frames: {num_frames}')
+        
+        # identify the first frame to get info
+        frame_info = {i: {} for i in range(num_frames)}
+        frame_info[0] = self.identify_image(frames[0])
+        # print(frame_info[0])
+
+    # =============================================================================
     # DETECTING ICONS
     # =============================================================================
     @timeit
-    def detect_icons(
+    def identify_image(
             self,
             rgb_image: np.ndarray,
             crop: bool = True,
             save_matches: bool = True,
             save_heatmaps: bool = False
             ):
+        
+        # make sure icons were loaded
+        icons = self.card_icons
+        if not icons:
+            return print('Unable to load icons: exiting...')
+        
+        # get original icon size (should be 100 x 100 px)
+        sample_icon = list(icons.values())[0]
+        orig_h, orig_w = sample_icon.shape[0:2]
         
         # create a copy of the input to avoid modifying the original
         img_rgb = self.standardize_input_image(rgb_image.copy())
@@ -451,36 +585,34 @@ class Matcher():
             self.default_scale = scale
             
             # get the top boundary of the box region
-            _h, _dh = info['boxes'][0][1], info['template_height']
-            box_top_boundary = _h + _dh
+            try:
+                _h, _dh = info['boxes'][0][1], info['template_height']
+                self.box_top_boundary = _h + _dh
+            except:
+                self.box_top_boundary = 0
             
         else:
             scale = self.default_scale
             
-        # get the position of the bottom boundary
-        box_bottom_boundary = self.find_bottom_boundary(img, scale)
-            
-        # trim the image to just the monster box so matching is faster
-        img = self.trim_image(img, top = box_top_boundary,
-                              bottom = box_bottom_boundary)
-        img_rgb = self.trim_image(img_rgb, top = box_top_boundary,
-                                  bottom = box_bottom_boundary)
-        
-        # get scrollbar position
-        scroll = self.get_scrollbar_position(img_rgb, scale)
-        
-        # make sure icons were loaded
-        icons = self.card_icons
-        if not icons:
-            return print('Unable to load icons: exiting...')
-        
-        # get original icon size (should be 100 x 100 px)
-        sample_icon = list(icons.values())[0]
-        orig_h, orig_w = sample_icon.shape[0:2]
-        
         # get new dimensions based on optimal rescale factor
         new_w, new_h = (int(scale*orig_w), int(scale*orig_h))
         print(f'Icon dimensions: ({new_w}, {new_h})')
+        
+        # store icon dimensions for access in other functions
+        self.icon_w, self.icon_h = new_w, new_h
+            
+        # get the position of the bottom boundary
+        if self.box_bottom_boundary is None:
+            self.box_bottom_boundary = self.find_bottom_boundary(img, scale)
+            
+        # trim the image to just the monster box so matching is faster
+        img = self.trim_image(img, top = self.box_top_boundary,
+                              bottom = self.box_bottom_boundary)
+        img_rgb = self.trim_image(img_rgb, top = self.box_top_boundary,
+                                  bottom = self.box_bottom_boundary)
+        
+        # get scrollbar position
+        scroll_info = self.get_scrollbar_position(img_rgb, scale)
         
         # get crop factor for icons - crop to exclude plusses, level, etc.
         if crop:
@@ -638,12 +770,24 @@ class Matcher():
                 print(f'    {category}:   {value}')
             print('\n')
             
-        return matched_cards
+        # compile match info
+        match_info = {
+            'img_rgb': img_rgb,
+            'scale': scale,
+            'icon_w': self.icon_w,
+            'icon_h': self.icon_h,
+            'scroll_info': scroll_info,
+            'unmatched_cards': unmatched_cards,
+            'matched_cards': matched_cards,
+            'num_matches': num_matches,
+            }
+            
+        return match_info
     
     def identify_all_images(self):
         for rgb_image in self.rgb_input_images:
             # asyncio.run(self.detect_icons(rgb_image))
-            matches = self.detect_icons(rgb_image)
+            matches = self.identify_image(rgb_image)
             
         return self.matched_cards
         
@@ -876,10 +1020,10 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
 # =============================================================================
 # UTILITIES
 # =============================================================================
-def gauss_sharpen(img: np.ndarray, sigma1 = 0.5, sigma2 = 1.0) -> np.ndarray:
+def gauss_sharpen(img: np.ndarray, sigma1 = 0.5, sigma2 = 1.5) -> np.ndarray:
     return gaussian_filter(img, sigma1) - gaussian_filter(img, sigma2)
 
-def to_numpy(image):
+def to_numpy(image) -> np.ndarray:
     if isinstance(image, Image.Image):
         return np.array(image)
     elif isinstance(image, np.ndarray):
@@ -903,10 +1047,10 @@ def to_gray(image: np.ndarray) -> np.ndarray:
         print(f'Unable to convert to grayscale: {ex}')
         return image
     
-def to_rgb(image: np.ndarray):
+def to_rgb(image: np.ndarray) -> np.ndarray:
     if isinstance(image, Image.Image):
         return np.array(image)
-    if not isinstance(np.ndarray):
+    if not isinstance(image, np.ndarray):
         print(f'Input should be numpy array, not {type(image)}')
         return image
     try:
@@ -920,7 +1064,7 @@ def to_rgb(image: np.ndarray):
         print(f'Unable to convert image to RGB: {ex}')
         return image
 
-def to_rgba(image: np.ndarray):
+def to_rgba(image: np.ndarray) -> np.ndarray:
     if isinstance(image, Image.Image):
         return np.array(image)
     try:
@@ -941,7 +1085,7 @@ def rgb_to_sharp_gray(
         ) -> np.ndarray:
     return gauss_sharpen(to_gray(rgb_image), sigma1, sigma2)
 
-def rescale(image: np.ndarray, scale: float):
+def rescale(image: np.ndarray, scale: float) -> np.ndarray:
     h, w = image.shape[0:2]
     new_size = int(w * scale), int(h * scale)
     try: 
@@ -949,7 +1093,7 @@ def rescale(image: np.ndarray, scale: float):
     except Exception as ex:
         print(f'Unable to rescale image by {scale}: {ex}')
         
-def save_rgb(image: np.ndarray, path: str):
+def save_rgb(image: np.ndarray, path: str) -> None:
     try:
         if image.ndim == 3:
             cv2.imwrite(path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
@@ -966,6 +1110,9 @@ def extract_region(image: np.ndarray, bbox: tuple, pad: int = 0) -> np.ndarray:
     region = image[(x1-pad):(x2+pad), (y1-pad):(y2+pad)]
     return region
 
+def peek(array: np.ndarray) -> None:
+    Image.fromarray(array).show() if not NO_PEEK else None
+
 # =============================================================================
 # LOADING VIDEO
 # =============================================================================
@@ -975,8 +1122,6 @@ def load_video_frames(filepath: str):
     frames = None
     print(f'Loading video frames from {filepath}')
     try:
-        # frames = vread(filepath)
-        
         # initialize video capture
         capture = cv2.VideoCapture(filepath)
         
@@ -991,7 +1136,8 @@ def load_video_frames(filepath: str):
         framecount = 0
         has_data = True
         while framecount < num_frames and has_data:
-            has_data, frames[framecount] = capture.read()
+            has_data, frame = capture.read()
+            frames[framecount] = to_rgb(frame)
             framecount += 1
             
         print(f'Loaded {frame_w} by {frame_h} video containing',
@@ -1014,7 +1160,8 @@ if __name__ == '__main__':
     # ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
-    matches = Matcher(ss_path).identify_all_images()
+    match_info = Matcher(ss_path).identify_all_images()
+    # match_info = Matcher(vid_path).identify_video(vid_path)
     
     # frames = load_video_frames(vid_path)
         
@@ -1024,10 +1171,10 @@ if __name__ == '__main__':
 # TODO LIST
 # =============================================================================
 '''
-    - Store monster list
     - Read from videos
-    - Integrate with interface
+    - Store monster list
+    - Create UI for interacting
     - Accept manual override grade (either add new or reject)
-
+    - Create stitched image of all icons from box list
 
 '''
