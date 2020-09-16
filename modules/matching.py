@@ -86,8 +86,8 @@ class Matcher():
         self.matched_images = []
         self.matched_cards = []
         self.input_videos = {}
-        self.box_bottom_boundary = None
-        self.box_top_boundary = None
+        self.box_bottom_boundary = 1
+        self.box_top_boundary = 0
         
         # parse the input images
         self.rgb_input_images = self.add_inputs(input_images)
@@ -170,6 +170,13 @@ class Matcher():
             return image
         
     # =============================================================================
+    # IMAGE UTILITIES
+    # =============================================================================
+    def trim_to_box(self, image: np.ndarray) -> np.ndarray:
+        return self.trim_image(image, top = self.box_top_boundary, 
+                               bottom = self.box_bottom_boundary)
+        
+    # =============================================================================
     # PROTECTED FUNCTIONS
     # =============================================================================
     @timeit
@@ -235,47 +242,76 @@ class Matcher():
         
         # get position of bottom boundary
         boundary = im_h - (match['boxes'][0][1] + temp_h)
+        match['boundary'] = boundary
+        match['temp_w'] = temp_w
+        match['temp_h'] = temp_h
         print(f'Bottom boundary: {boundary}')
-        return boundary
+        return match
     
     @timeit
-    def get_scrollbar_position(
+    def get_scrollbar_info(
             self,
             input_image: np.ndarray,
-            scale: float
+            scale: float,
+            scroll_bbox: tuple = None,
             ) -> tuple:
         
-        # get the scrollbar template
-        template = self.scrollbar_template
-        if template is None:
-            return print('Unable to get scrollbar position: missing template')
+        # skip matching if the region is already known
+        if scroll_bbox is not None:
+            (tl_x, tl_y), (br_x, br_y) = scroll_bbox
         
-        # convert inputs to grayscale
-        template = to_gray(template)
-        input_image = to_gray(input_image)
+        else:
+            ctxt_h, ctxt_w = self.cards_text_template.shape[0:2]
+            ctxt_h, ctxt_w = ctxt_h*scale*(100/164), ctxt_w*scale*(100/164)
+            
+            # get scrollbar boundary using some hacky relative position bullshit
+            _info = self.bottom_boundary_info
+            _tl_x = _info['boxes'][0][0]
+            _tl_y = _info['boxes'][0][1]
+            br_x = int(_tl_x + (298/140)*ctxt_w)
+            br_y = int(_tl_y - (10/52)*ctxt_h)
+            tl_x = int(br_x - (41/140)*ctxt_w)
+            tl_y = int(self.box_top_boundary + (136/52)*ctxt_h)
         
-        # resize template based on known scaling factor
-        template = rescale(template, (100/164)*scale) # 100 / 164
-        temp_h, temp_w = template.shape[0:2]
+        # # get the scrollbar template
+        # template = self.scrollbar_template
+        # if template is None:
+        #     return print('Unable to get scrollbar position: missing template')
         
-        # get match position
-        match = find_matches(input_image, template)
-        match['name'] = 'scrollbar'
-        if not match['matched']:
-            return print('Unable to get scrollbar position: no match found')
+        # # convert inputs to grayscale
+        # template = to_gray(template)
+        # input_image = to_gray(input_image)
         
-        # show the bounding region
-        box = match['boxes'][0]
-        tl_x, tl_y = box
-        br_x, br_y = tl_x + temp_w, tl_y + temp_h
-        match['bbox'] = (tl_x, tl_y), (tl_x + temp_w, tl_y + temp_h)
+        # # resize template based on known scaling factor
+        # template = rescale(template, (100/164)*scale) # 100 / 164
+        # temp_h, temp_w = template.shape[0:2]
+        
+        # # skip matching if the region is already known
+        # if scroll_bbox is not None:
+        #     (tl_x, tl_y), (br_x, br_y) = scroll_bbox
+
+        # else:        
+        #     # get match position
+        #     match = find_matches(input_image, template)
+        #     match['name'] = 'scrollbar'
+        #     if not match['matched']:
+        #         return print('Unable to get scrollbar position: no match found')
+            
+        #     # show the bounding region
+        #     box = match['boxes'][0]
+        #     tl_x, tl_y = box
+        #     br_x, br_y = tl_x + temp_w, tl_y + temp_h
+        #     match['bbox'] = (tl_x, tl_y), (br_x, br_y)
         
         # show the region
         scroll_region = input_image[tl_y:br_y, tl_x:br_x]
         # self.show_matches(input_image, template, match, show_full_box=False, save_heatmap=True)
         
         # analyze the scrollbar region
-        return self.analyze_scrollbar(scroll_region)
+        scroll_info = self.analyze_scrollbar(scroll_region)
+        scroll_info['bbox'] = (tl_x, tl_y), (br_x, br_y)
+        # scroll_info.update(match)
+        return scroll_info
         
     def analyze_scrollbar(
             self,
@@ -292,6 +328,8 @@ class Matcher():
         # trim input image to just the scrollbar
         trimmed = scrollbar[scroll_bot:scroll_top, :]
         
+        # peek(trimmed)
+        
         # get scrollbar dimensions
         scroll_h, scroll_w = scrollbar.shape[0:2]
         
@@ -301,14 +339,26 @@ class Matcher():
         
         # get position of the middle of the handle relative to scrollbar
         h_vals = active[0]
+        
+        # skip if scrollbar is not found
+        if len(h_vals) == 0:
+            print('Scrollbar handle not found')
+            # peek(no_bg)
+            # peek(scrollbar)
+            # peek(trimmed)
+            # peek(np.where(trimmed > 175, 255, 0))
+            return {'scroll_h': scroll_h, 'scroll_w': scroll_w, 'trimmed': trimmed,
+                    'matched': False}
+        
         bot, top = max(h_vals), min(h_vals)
+            
         mid = (bot + top) / 2
         handle_height = abs(top - bot)
         
         # get approximate page that the current screen is on
         # rows per page: 46 rows in a box -> 164px handle, 1141px scroll
         # this is true for the Galaxy S10+, will not be exact for others
-        rows_per_page = (scroll_h / self.icon_h) * 0.875
+        rows_per_page = (scroll_h / self.icon_h) * 0.8575
         total_pages = scroll_h / handle_height
         total_rows = int(total_pages * rows_per_page)
         
@@ -316,19 +366,13 @@ class Matcher():
         page_num = bot / handle_height
         
         # get index of top and bottom card row (one-indexed)
-        bot_partial_row = (rows_per_page * page_num)
         top_partial_row = (rows_per_page * page_num) - (rows_per_page - 1)
-        
-        # check if top or bottom rows are cut off (based on calculations)
-        cutoff_bot = ((((bot_partial_row % 1) < 0.05) or ((bot_partial_row % 1 > 0.20)))
-                      and (bot_partial_row > math.floor(rows_per_page)))
-        cutoff_top = ((top_partial_row % 1) > 0.20) and (top_partial_row > 2)
+        bot_partial_row = (rows_per_page * page_num)
         
         # get the top / bottom FULL row
-        bot_full_row = (math.floor(bot_partial_row) if cutoff_bot 
-                        else math.ceil(bot_partial_row))
-        top_full_row = (math.ceil(top_partial_row) if cutoff_top 
-                        else math.floor(top_partial_row))
+        top_full_row = math.ceil(top_partial_row - 0.25)
+        bot_full_row = math.floor(bot_partial_row - 0.25)
+        num_full_rows = abs(top_full_row - bot_full_row) + 1
         
         # calculate minimum number of cards in box: 
         min_cards = 4 + 5*(total_rows - 2) + 1
@@ -337,34 +381,39 @@ class Matcher():
         
         print(f'Scrollbar height: {scroll_h}')
         print(f'Handle height: {handle_height}')
+        print(f'Estimated total pages: {total_pages}')
         print(f'Estimated page #: {page_num}')
         print(f'Estimated number of rows: {total_rows}')
         print(f'Estimated cards in box: {num_cards}')
-        print(f'Bottom partial row: {bot_partial_row}')
         print(f'Top partial row: {top_partial_row}')
-        print(f'Bottom full row: {bot_full_row}')
+        print(f'Bottom partial row: {bot_partial_row}')
         print(f'Top full row: {top_full_row}')
-        print(f'Is bottom row of cards cut off? {cutoff_bot}')
-        print(f'Is top row of cards cut off? {cutoff_top}')
+        print(f'Bottom full row: {bot_full_row}')
         
         scrollbar_info = {
+            'matched': True,
+            # 'trimmed': trimmed,
             'scroll_w': scroll_w,
             'scroll_h': scroll_h,
-            'bot': bot,
-            'mid': mid,
             'top': top,
+            'mid': mid,
+            'bot': bot,
             'handle_height': handle_height,
             'rows_per_page': rows_per_page,
             'total_pages': total_pages,
             'total_rows': total_rows,
-            'bot_partial_row': bot_partial_row,
+            'page_num': page_num,
             'top_partial_row': top_partial_row,
-            'bot_full_row': bot_full_row,
+            'bot_partial_row': bot_partial_row,
             'top_full_row': top_full_row,
-            'cutoff_bot': cutoff_bot,
-            'cutoff_top': cutoff_top,
+            'bot_full_row': bot_full_row,
+            'row_span': (top_full_row, bot_full_row),
+            'num_full_rows': abs(top_full_row - bot_full_row) + 1,
+            'included_rows': list(range(top_full_row, bot_full_row + 1)),
             'min_cards': min_cards,
             'max_cards': max_cards,
+            'max_possible_rows': math.floor(rows_per_page) == num_full_rows,
+            'actual_page': (bot_full_row) / math.floor(rows_per_page)
             }
         
         return scrollbar_info
@@ -475,6 +524,9 @@ class Matcher():
         regions = {bbox: extract_region(input_image, bbox)
                    for bbox in bboxes}
         
+        regions_rgb = {bbox: extract_region(orig_img, bbox)
+                       for bbox in bboxes}
+        
         # match all the regions
         matched_cards = []
         unmatched_regions = regions.copy()
@@ -524,6 +576,10 @@ class Matcher():
         if not matched_cards:
             print(f'No match found for predicted {attributes} card')
             
+        # fixed unmatched regions
+        unmatched_regions = {bbox: region for bbox, region in regions_rgb.items()
+                             if bbox in unmatched_regions.keys()}
+            
         return matched_cards, unmatched_regions
 
     # =============================================================================
@@ -547,9 +603,83 @@ class Matcher():
         print(f'Number of frames: {num_frames}')
         
         # identify the first frame to get info
-        frame_info = {i: {} for i in range(num_frames)}
-        frame_info[0] = self.identify_image(frames[0])
-        # print(frame_info[0])
+        frame_info = {}
+        first_match = None
+        for i in range(num_frames):
+            first_match = self.identify_image(frames[i])
+            if first_match is not None:
+                frame_info[i] = first_match
+                break
+        
+        # get scrollbar info for each frame
+        scale = first_match.get('scale', self.default_scale)
+        scroll_bbox = first_match.get('bbox', None)
+        scroll_info = {}
+        for i in range(num_frames):
+            print(f'Getting scrollbar info: {num_frames-i} remaining...')
+            frame = self.standardize_input_image(frames[i])
+            scroll_info[i] = self.get_scrollbar_info(frame, scale, scroll_bbox)
+            
+        # remove rows with no data
+        df = pd.DataFrame.from_dict(scroll_info, orient='index')
+        df = df[df['matched'] == True]
+        
+        # remove outliers
+        med, std = df['handle_height'].median(), df['handle_height'].std()
+        mask = ((abs(df['handle_height'] - med) < 5) | 
+                (df['handle_height'] > med - 0.3*std) & 
+                (df['handle_height'] < med + 0.3*std))
+        df = df[mask]
+        
+        # sort by top full row
+        df.sort_values(by=['top_full_row'], ascending=True, inplace=True)
+        
+        # drop duplicates
+        df.drop_duplicates(subset='row_span', inplace=True, keep='first')
+        
+        # remove more duplicates
+        df.sort_values(by=['actual_page', 'num_full_rows'], inplace=True, ascending=True)
+        df.drop_duplicates(subset='actual_page', inplace=True, keep='last')
+        
+        # find all frames to use
+        selected = df.head(1)
+        unselected = df.copy()
+        while True:
+            # break when selection is complete
+            if selected['actual_page'].max() == df['actual_page'].max():
+                break
+            
+            # look for page 1 after the previous
+            last_page = selected['actual_page'].max()
+            next_page = unselected[(unselected['actual_page'] == last_page + 1) &
+                                   (unselected['max_possible_rows'] == True)]
+            if len(next_page) == 1:
+                selected = pd.concat([selected, next_page])
+                unselected = unselected[unselected['actual_page'] > last_page + 1]
+                continue
+            
+            # if page still isn't found, find one with slight overlap
+            next_page = unselected[(unselected['actual_page'] < last_page + 1)]
+            if len(next_page) >= 1:
+                selected = pd.concat([selected, next_page.tail(1)])
+                unselected = unselected[unselected['actual_page'] > 
+                                        next_page['actual_page'].max()]
+                continue
+            
+        # get match info for all selected frames
+        rem = len(selected)
+        print(f'Selected {len(selected)} frames for analysis')
+        for i, row in selected.iterrows():
+            # make sure the frame wasn't already checked in the initial run
+            if i in frame_info.keys():
+                continue
+            
+            # get matches for that frame
+            print(f'Getting matches in frame {i}: {len(selected)-rem} remaining...')
+            frame_info[i] = self.identify_image(frames[i])
+            rem -= 1
+        
+        return frame_info
 
     # =============================================================================
     # DETECTING ICONS
@@ -576,12 +706,12 @@ class Matcher():
         img_rgb = self.standardize_input_image(rgb_image.copy())
         
         # preprocess the image for detections
-        img = self.standardize_template(img_rgb, 1.0)
+        img_gray = self.standardize_template(img_rgb, 1.0)
 
         # get optimal rescale factor for resizing card & orb icons
         if self.default_scale is None:
             std_temp = self.standard_template
-            scale, info = get_best_scale(img, std_temp)
+            scale, info = get_best_scale(img_gray, std_temp)
             self.default_scale = scale
             
             # get the top boundary of the box region
@@ -602,17 +732,16 @@ class Matcher():
         self.icon_w, self.icon_h = new_w, new_h
             
         # get the position of the bottom boundary
-        if self.box_bottom_boundary is None:
-            self.box_bottom_boundary = self.find_bottom_boundary(img, scale)
-            
-        # trim the image to just the monster box so matching is faster
-        img = self.trim_image(img, top = self.box_top_boundary,
-                              bottom = self.box_bottom_boundary)
-        img_rgb = self.trim_image(img_rgb, top = self.box_top_boundary,
-                                  bottom = self.box_bottom_boundary)
+        # if self.box_bottom_boundary is None:
+        self.bottom_boundary_info = self.find_bottom_boundary(img_gray, scale)
+        self.box_bottom_boundary = self.bottom_boundary_info['boundary']
         
         # get scrollbar position
-        scroll_info = self.get_scrollbar_position(img_rgb, scale)
+        scroll_info = self.get_scrollbar_info(img_rgb, scale)
+            
+        # trim the image to just the monster box so matching is faster
+        img = self.trim_to_box(img_gray)
+        img_rgb = self.trim_to_box(img_rgb)
         
         # get crop factor for icons - crop to exclude plusses, level, etc.
         if crop:
@@ -756,7 +885,7 @@ class Matcher():
         #         matched_cards += future.result()
         
         # update the list of all matched cards
-        self.matched_cards.append(matched_cards)
+        self.matched_cards += matched_cards
     
         num_matches = len(matched_cards)
         print(f'\n{num_matches} cards matched ({num_expected_matches} predicted)\n')
@@ -774,8 +903,12 @@ class Matcher():
         match_info = {
             'img_rgb': img_rgb,
             'scale': scale,
+            'image_w': img_gray.shape[1],
+            'image_h': img_gray.shape[0],
             'icon_w': self.icon_w,
             'icon_h': self.icon_h,
+            'box_top_boundary': self.box_top_boundary,
+            'box_bottom_boundary': self.box_bottom_boundary,
             'scroll_info': scroll_info,
             'unmatched_cards': unmatched_cards,
             'matched_cards': matched_cards,
@@ -1107,11 +1240,14 @@ def save_rgb(image: np.ndarray, path: str) -> None:
 def extract_region(image: np.ndarray, bbox: tuple, pad: int = 0) -> np.ndarray:
     ((y1, x1), (y2, x2)) = bbox
     pad = int(pad*y1) if (0 < abs(pad) < 1) else pad
-    region = image[(x1-pad):(x2+pad), (y1-pad):(y2+pad)]
+    region = image[(x1-pad):(x2+pad), (y1-pad):(y2+pad)].copy()
     return region
 
 def peek(array: np.ndarray) -> None:
-    Image.fromarray(array).show() if not NO_PEEK else None
+    try:
+        Image.fromarray(array).show() if not NO_PEEK else None
+    except Exception as ex:
+        print(f'Could not show image: {ex}')
 
 # =============================================================================
 # LOADING VIDEO
@@ -1160,8 +1296,8 @@ if __name__ == '__main__':
     # ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
-    match_info = Matcher(ss_path).identify_all_images()
-    # match_info = Matcher(vid_path).identify_video(vid_path)
+    # match_info = Matcher(ss_path).identify_all_images()
+    match_info = Matcher(vid_path).identify_video(vid_path)
     
     # frames = load_video_frames(vid_path)
         
