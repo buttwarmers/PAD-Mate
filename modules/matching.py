@@ -56,7 +56,7 @@ READ_MODE = cv2.IMREAD_UNCHANGED
 FONT = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 2.5
 SLEEP = 0.0001
-DEFAULT_SCREENSHOT_WIDTH = 750 # minimum size to still detect orbs consistently
+DEFAULT_SCREENSHOT_WIDTH = 800 # min. size to detect orbs consistently // 750
 DEFAULT_SCALE_WIDTH = DEFAULT_SCREENSHOT_WIDTH
 NO_PEEK = False
 DEBUG = False
@@ -150,6 +150,39 @@ class Matcher():
             template = cv2.resize(template, dsize=dsize, interpolation=INTERPOLATION)
         template = gauss_sharpen(template)    
         return template
+    
+    @staticmethod
+    def get_matched_cards(match_list: list):
+        if isinstance(match_list, dict):
+            match_list = [match_list]
+        matches = []
+        for match_info in match_list:
+            if not isinstance(match_info, dict):
+                continue
+            for match in match_info.get('matched_cards', []):
+                matches.append(match.get('name', None))
+        print(f'Total number of matches: {len(matches)}')
+        return matches
+    
+    @staticmethod
+    def get_unmatched_regions(match_list: list):
+        if isinstance(match_list, dict):
+            match_list = [match_list]
+        unmatched = []
+        for match_info in match_list:
+            if not isinstance(match_info, dict):
+                continue
+            for attr, region in match_info.get('unmatched_cards', {}).items():
+                # for bbox, region in regions.items():
+                unmatched.append((attr, region))
+        print(f'Number of unmatched regions: {len(unmatched)}')
+        return unmatched
+    
+    @staticmethod
+    def is_cutoff(icon: np.ndarray):
+        short, long = sorted(list(icon.shape[0:2]))
+        try: return abs(short / long) < 0.9
+        except: return False
     
     # =============================================================================
     # CLASS METHODS
@@ -418,18 +451,17 @@ class Matcher():
         
         return scrollbar_info
     
-    @classmethod
     def find_orbs(
-            cls,
+            self,
             input_image: np.ndarray, 
             orb: np.ndarray, 
             color: str, 
-            crop_factor: float = 0.15
             ) -> tuple:
         
         # crop the orb
-        orb = cls.crop_orb(orb, crop_factor)
-        dh, dw = crop_factor * orb.shape[0], crop_factor * orb.shape[1]
+        orb = self.crop_orb(orb, self.orb_crop_factor)
+        dh = self.orb_crop_factor * orb.shape[0]
+        dw = self.orb_crop_factor * orb.shape[1]
         offsets = (dw, dw), (dh, dh)
         
         # find matches for the orb in the input image
@@ -438,9 +470,31 @@ class Matcher():
         matches['offests'] = offsets
         return (color, matches)
     
-    @classmethod
+    def count_orbs(
+            self, 
+            region: np.ndarray, 
+            orbs: dict = None,
+            scale: float = None,
+            standardize: bool = True
+            ) -> bool:
+        
+        # check if the region contains an orb
+        scale = self.default_scale if scale is None else scale
+        if orbs is None:
+            orbs = {k: self.standardize_template(v, scale) 
+                    for k, v in self.orb_icons.items()}
+        if standardize:
+            region = self.standardize_template(region, scale)
+        orb_count = 0
+        for _, orb in orbs.items():
+            cropped = self.crop_orb(orb, self.orb_crop_factor)
+            matches = find_matches(cropped, orb)
+            matched = matches.get('matched', False)
+            orb_count += int(matched)
+        return orb_count
+    
+    @staticmethod
     def show_matches(
-            cls,
             input_image: np.ndarray, 
             template: np.ndarray, 
             matches: dict,
@@ -513,7 +567,7 @@ class Matcher():
         
         if len(bboxes) == 0:
             print(f'\nNo {attributes} regions identified...\n')
-            return [], {}
+            return [], {}, {}
         
         print(f'\nIdentifying {attributes} region...\n')
         
@@ -524,6 +578,7 @@ class Matcher():
         regions = {bbox: extract_region(input_image, bbox)
                    for bbox in bboxes}
         
+        # get RGB icons for reviewing later
         regions_rgb = {bbox: extract_region(orig_img, bbox)
                        for bbox in bboxes}
         
@@ -543,7 +598,7 @@ class Matcher():
             for (bbox, region) in regions.items():
                 # return if all regions have been matched
                 if len(unmatched_regions) == 0:
-                    return matched_cards, unmatched_regions
+                    return matched_cards, unmatched_regions, {}
                 
                 # make sure region hasn't already been matched
                 if bbox not in unmatched_regions.keys():
@@ -577,10 +632,10 @@ class Matcher():
             print(f'No match found for predicted {attributes} card')
             
         # fixed unmatched regions
-        unmatched_regions = {bbox: region for bbox, region in regions_rgb.items()
-                             if bbox in unmatched_regions.keys()}
+        unmatched_regions_rgb = {bbox: region for bbox, region in regions_rgb.items()
+                                 if bbox in unmatched_regions.keys()}
             
-        return matched_cards, unmatched_regions
+        return matched_cards, unmatched_regions, unmatched_regions_rgb
 
     # =============================================================================
     # GETTING BEST VIDEO FRAMES
@@ -615,6 +670,7 @@ class Matcher():
         scale = first_match.get('scale', self.default_scale)
         scroll_bbox = first_match.get('bbox', None)
         scroll_info = {}
+        
         for i in range(num_frames):
             print(f'Getting scrollbar info: {num_frames-i} remaining...')
             frame = self.standardize_input_image(frames[i])
@@ -666,20 +722,18 @@ class Matcher():
                                         next_page['actual_page'].max()]
                 continue
             
-        # get match info for all selected frames
-        rem = len(selected)
-        print(f'Selected {len(selected)} frames for analysis')
-        for i, row in selected.iterrows():
-            # make sure the frame wasn't already checked in the initial run
-            if i in frame_info.keys():
-                continue
+        # clear unnecessary frames from memory
+        frames = {i: frames[i] for i in selected.index if i not in frame_info.keys()}
             
-            # get matches for that frame
-            print(f'Getting matches in frame {i}: {len(selected)-rem} remaining...')
-            frame_info[i] = self.identify_image(frames[i])
-            rem -= 1
-        
-        return frame_info
+        # get match info for all selected frames
+        print(f'Selected {len(selected)} frames for analysis')
+        matches = []
+        for i, frame in frames.items():
+            match_info = self.identify_image(frame)
+            match_info['frame'] = i
+            matches.append(match_info)
+            
+        return matches
 
     # =============================================================================
     # DETECTING ICONS
@@ -689,6 +743,7 @@ class Matcher():
             self,
             rgb_image: np.ndarray,
             crop: bool = True,
+            analyze_scrollbar: bool = False,
             save_matches: bool = True,
             save_heatmaps: bool = False
             ):
@@ -737,7 +792,9 @@ class Matcher():
         self.box_bottom_boundary = self.bottom_boundary_info['boundary']
         
         # get scrollbar position
-        scroll_info = self.get_scrollbar_info(img_rgb, scale)
+        scroll_info = None
+        if analyze_scrollbar:
+            scroll_info = self.get_scrollbar_info(img_rgb, scale)
             
         # trim the image to just the monster box so matching is faster
         img = self.trim_to_box(img_gray)
@@ -766,7 +823,7 @@ class Matcher():
         # detect orb positions
         print('\nDetecting attributes...\n')
         orb_results = {color: matches for (color, matches) in
-                        (self.find_orbs(img, orb, color, self.orb_crop_factor) 
+                        (self.find_orbs(img, orb, color) 
                         for color, orb in orbs.items())}
         
         # save images of orb results
@@ -844,12 +901,32 @@ class Matcher():
                 br_y = tl_y + new_h + LINEWIDTH
             top_left = (tl_x, tl_y)
             bottom_right = (br_x, br_y)
-            cv2.rectangle(pairs_img, top_left, bottom_right, LINECOLOR, LINEWIDTH)
             
-            # store bounding box information
+            # make sure the region is not cutoff
+            dx, dy = abs(br_x - tl_x), abs(br_y - tl_y)
+            aspect = dx / dy
+            aspect = 1 / aspect if aspect > 1 else aspect
+            if aspect < 0.9:
+                continue
+            
+            # get bounding box
             bbox = (top_left, bottom_right)
             sattr = sattr if sattr else ''
+            
+            # get region
+            reg = extract_region(img, bbox, pad=0)
+            
+            # if the region is supposedly single attribute, check for orbs
+            if sattr is None:
+                num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
+                if num_orbs > 1:
+                    continue
+            
+            # store bounding box information for valid predicted regions
             card_bboxes.append((f'{attr}{sattr}', bbox))
+            
+            # show the box
+            cv2.rectangle(pairs_img, top_left, bottom_right, LINECOLOR, LINEWIDTH)
             
         # report how many cards are predicted and group bboxes by attributes
         print(f'\n{num_expected_matches} card(s) predicted:')
@@ -866,23 +943,36 @@ class Matcher():
         # TODO: skip icon regions that are cut off at top or bottom
         matched_cards = []
         unmatched_cards = {}
-        
         # REGULAR
         for attrs, bboxes in predictions.items():
-            matched, unmatched = self.identify_region(img, img_rgb, attrs, bboxes, 
-                                                      icons, scale, icon_offsets, crop)
+            matched, unmatched, unmatched_rgb = self.identify_region(
+                                                        img, img_rgb, attrs, 
+                                                        bboxes, icons, scale,
+                                                        icon_offsets, crop)
             matched_cards += matched
-            unmatched_cards[attrs] = unmatched
+            unmatched_cards[attrs] = unmatched_rgb
             
-        # TODO: something with the unmatched cards? prompt user to ID manually?
-        
-        # MULTIPROCESSING
-        # with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
-        #     futures = [pool.submit(self.identify_region, img, img_rgb, attrs, bboxes,
-        #                             icons, scale, icon_offsets, crop) 
-        #                 for (attrs, bboxes) in predictions.items()]
-        #     for future in concurrent.futures.as_completed(futures):
-        #         matched_cards += future.result()
+        # try again for unmatched regions with 1 attribute, checking again 
+        # with all subattributes
+        for attr, regions in unmatched_cards.items():
+            if len(attr) > 1 or len(regions) == 0:
+                continue
+            for bbox, _ in regions.items():
+                new_matches = []
+                for attrs in [attr + s for s in ['r', 'b', 'g', 'l', 'd']]:
+                    new_match, _, _ = self.identify_region(
+                                                    img, img_rgb, attrs,
+                                                    [bbox], icons, scale,
+                                                    icon_offsets, crop)
+                    if not new_match:
+                        continue
+                    new_matches += new_match
+                
+                # choose the best match if there are multiple
+                if not new_matches:
+                    continue
+                best_match = sorted(new_matches, key=lambda m: m['confidence'])[-1]
+                matched_cards += [best_match]
         
         # update the list of all matched cards
         self.matched_cards += matched_cards
@@ -910,7 +1000,7 @@ class Matcher():
             'box_top_boundary': self.box_top_boundary,
             'box_bottom_boundary': self.box_bottom_boundary,
             'scroll_info': scroll_info,
-            'unmatched_cards': unmatched_cards,
+            'unmatched_cards': unmatched_rgb,
             'matched_cards': matched_cards,
             'num_matches': num_matches,
             }
