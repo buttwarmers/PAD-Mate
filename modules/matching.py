@@ -12,6 +12,7 @@ import pandas as pd
 from scipy.ndimage import gaussian_filter
 import concurrent.futures
 import math
+import itertools
 # from threading import Thread
 # from queue import Queue
 # import asyncio
@@ -20,11 +21,11 @@ import math
 
 try:
     from .assetmanager import AssetManager
-    from .utils import timeit, pt_sep, imread_rgba, imread_rgb
+    from .utils import timeit, pt_sep, imread_rgba, imread_rgb, in_box
 except:
     os.chdir(os.path.dirname(__file__))
     from assetmanager import AssetManager
-    from utils import timeit, pt_sep, imread_rgba, imread_rgb
+    from utils import timeit, pt_sep, imread_rgba, imread_rgb, in_box
 
 # =============================================================================
 # LOGGING
@@ -60,7 +61,7 @@ DEFAULT_SCREENSHOT_WIDTH = 800 # min. size to detect orbs consistently // 750
 DEFAULT_SCALE_WIDTH = DEFAULT_SCREENSHOT_WIDTH
 NO_PEEK = False
 DEBUG = False
-# DEBUG = True
+ROW_OVERLAP = 1
 
 # =============================================================================
 # MAIN MATCHING CLASS
@@ -403,8 +404,8 @@ class Matcher():
         bot_partial_row = (rows_per_page * page_num)
         
         # get the top / bottom FULL row
-        top_full_row = math.ceil(top_partial_row - 0.25)
-        bot_full_row = math.floor(bot_partial_row - 0.25)
+        top_full_row = math.ceil(top_partial_row - 0.15)
+        bot_full_row = math.floor(bot_partial_row - 0.40)
         num_full_rows = abs(top_full_row - bot_full_row) + 1
         
         # calculate minimum number of cards in box: 
@@ -486,11 +487,15 @@ class Matcher():
         if standardize:
             region = self.standardize_template(region, scale)
         orb_count = 0
-        for _, orb in orbs.items():
+        attrs = []
+        for attr, orb in orbs.items():
             cropped = self.crop_orb(orb, self.orb_crop_factor)
-            matches = find_matches(cropped, orb)
+            matches = find_matches(region, cropped)
             matched = matches.get('matched', False)
-            orb_count += int(matched)
+            if matched:
+                orb_count += 1
+                attrs.append(attr)
+        print(f'Detected {orb_count} orbs: {attrs}')
         return orb_count
     
     @staticmethod
@@ -694,33 +699,24 @@ class Matcher():
         df.drop_duplicates(subset='row_span', inplace=True, keep='first')
         
         # remove more duplicates
-        df.sort_values(by=['actual_page', 'num_full_rows'], inplace=True, ascending=True)
-        df.drop_duplicates(subset='actual_page', inplace=True, keep='last')
+        df.sort_values(by=['page_num', 'num_full_rows'], inplace=True, ascending=True)
+        # df.drop_duplicates(subset='actual_page', inplace=True, keep='last')
         
-        # find all frames to use
+        # find all frames to use - always use the top and bottom of box
         selected = df.head(1)
-        unselected = df.copy()
-        while True:
-            # break when selection is complete
-            if selected['actual_page'].max() == df['actual_page'].max():
-                break
-            
+        for _ in range(len(df)):
             # look for page 1 after the previous
-            last_page = selected['actual_page'].max()
-            next_page = unselected[(unselected['actual_page'] == last_page + 1) &
-                                   (unselected['max_possible_rows'] == True)]
-            if len(next_page) == 1:
-                selected = pd.concat([selected, next_page])
-                unselected = unselected[unselected['actual_page'] > last_page + 1]
-                continue
-            
-            # if page still isn't found, find one with slight overlap
-            next_page = unselected[(unselected['actual_page'] < last_page + 1)]
+            last_row = selected['bot_full_row'].max()
+            next_page = df[(df['top_full_row'] <= last_row - ROW_OVERLAP)]
             if len(next_page) >= 1:
                 selected = pd.concat([selected, next_page.tail(1)])
-                unselected = unselected[unselected['actual_page'] > 
-                                        next_page['actual_page'].max()]
                 continue
+            
+        # add the last frame to make sure the whole box is captured
+        selected = pd.concat([selected, df.tail(1)])
+        selected = selected[~selected.index.duplicated()]
+        
+        # return df
             
         # clear unnecessary frames from memory
         frames = {i: frames[i] for i in selected.index if i not in frame_info.keys()}
@@ -780,11 +776,11 @@ class Matcher():
             scale = self.default_scale
             
         # get new dimensions based on optimal rescale factor
-        new_w, new_h = (int(scale*orig_w), int(scale*orig_h))
-        print(f'Icon dimensions: ({new_w}, {new_h})')
+        icon_w, icon_h = (int(scale*orig_w), int(scale*orig_h))
+        print(f'Icon dimensions: ({icon_w}, {icon_h})')
         
         # store icon dimensions for access in other functions
-        self.icon_w, self.icon_h = new_w, new_h
+        self.icon_w, self.icon_h = icon_w, icon_h
             
         # get the position of the bottom boundary
         # if self.box_bottom_boundary is None:
@@ -802,17 +798,17 @@ class Matcher():
         
         # get crop factor for icons - crop to exclude plusses, level, etc.
         if crop:
-            dh0 = int(0.45 * new_h) # top offset ; 0.45 default
-            dh1 = int(0.30 * new_h) # bottom offset ; 0.30 default
-            dw0 = int(0.15 * new_w) # left offset ; 0.15 default
-            dw1 = int(0.15 * new_w) # right offset ; 0.15 default
+            dh0 = int(0.45 * icon_h) # top offset ; 0.45 default
+            dh1 = int(0.30 * icon_h) # bottom offset ; 0.30 default
+            dw0 = int(0.15 * icon_w) # left offset ; 0.15 default
+            dw1 = int(0.15 * icon_w) # right offset ; 0.15 default
         else:
-            dh0 = dh1 = dw0 = dw1 = int(0.1 * new_h)
+            dh0 = dh1 = dw0 = dw1 = int(0.1 * icon_h)
             
         # make sure the crop dimensions are valid
         dh1, dw1 = max(1, dh1), max(1, dw1)
-        dh0, dh1 = (0, 1) if (dh0 + dh1) >= new_h else (dh0, dh1)
-        dw0, dw1 = (0, 1) if (dw0 + dw1) >= new_w else (dw0, dw1)
+        dh0, dh1 = (0, 1) if (dh0 + dh1) >= icon_h else (dh0, dh1)
+        dw0, dw1 = (0, 1) if (dw0 + dw1) >= icon_w else (dw0, dw1)
         icon_offsets = ((dw0, dw1), (dh0, dh1))
         print(f'Icon offsets: {icon_offsets}')
         
@@ -853,15 +849,16 @@ class Matcher():
             x2 = pos_2[0] + orb_w + orb_offset_w
             y2 = pos_2[1] + orb_h + orb_offset_h
             dx, dy = x2 - x1, y2 - y1
-            return (abs(dx - new_w) < 15) and (abs(dy - new_h) < 15) # < 10 default
+            return (abs(dx - icon_w) < 15) and (abs(dy - icon_h) < 15) # < 10 default
         
         # for checking if lefover orbs are actually single attribute cards or not
         def not_single(orb_1, orb_2):
+            invalid = (orb_1[0] + icon_w > img.shape[1])
             different = (orb_1 != orb_2)
-            staggered = abs(orb_1[0] - orb_2[0]) > orb_w
+            staggered = (abs(orb_1[0] - orb_2[0]) > orb_w)
+            close = (pt_sep(orb_1, orb_2) < 0.75*icon_h)
             above = (orb_1[1] - orb_2[1]) < 0
-            close = (pt_sep(orb_1, orb_2) < new_h)
-            return staggered and above and close and different
+            return invalid or (different and staggered and close and above)
         
         # get dual attribute cards
         classified_orbs = []
@@ -877,15 +874,13 @@ class Matcher():
                     dual_attr.append((orb_1, orb_2))
                     classified_orbs += [orb_1, orb_2]
            
-        # get single attribute cards - must not have any other orbs nearby
-        not_classified = [orb for orb in orb_positions if orb not in classified_orbs]
+        # get single attribute cards
         single_attr = [(orb, (None, (None, None))) for orb in orb_positions 
-                       if orb not in classified_orbs and not any(
-                       not_single(orb[1], orb2[1]) for orb2 in not_classified)]
+                        if orb not in classified_orbs and not any(
+                        not_single(orb[1], orb2[1]) for orb2 in classified_orbs)]
         
         # combine the two to get all predicted card locations and attributes
         predicted_cards = dual_attr + single_attr
-        num_expected_matches = len(predicted_cards)
         
         # display predicted card locations and get bounding boxes
         pairs_img = img_rgb.copy()
@@ -897,16 +892,13 @@ class Matcher():
                 br_x = br[0] + orb_w + orb_offset_w + LINEWIDTH
                 br_y = br[1] + orb_h + orb_offset_h + LINEWIDTH
             else:
-                br_x = tl_x + new_w + LINEWIDTH
-                br_y = tl_y + new_h + LINEWIDTH
+                br_x = tl_x + icon_w + LINEWIDTH
+                br_y = tl_y + icon_h + LINEWIDTH
             top_left = (tl_x, tl_y)
             bottom_right = (br_x, br_y)
             
             # make sure the region is not cutoff
-            dx, dy = abs(br_x - tl_x), abs(br_y - tl_y)
-            aspect = dx / dy
-            aspect = 1 / aspect if aspect > 1 else aspect
-            if aspect < 0.9:
+            if tl_y < 0 or br_y > img.shape[0]:
                 continue
             
             # get bounding box
@@ -914,13 +906,13 @@ class Matcher():
             sattr = sattr if sattr else ''
             
             # get region
-            reg = extract_region(img, bbox, pad=0)
+            # reg = extract_region(img, bbox, pad=0)
             
             # if the region is supposedly single attribute, check for orbs
-            if sattr is None:
-                num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
-                if num_orbs > 1:
-                    continue
+            # if not sattr:
+            #     num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
+            #     if num_orbs > 1:
+            #         continue
             
             # store bounding box information for valid predicted regions
             card_bboxes.append((f'{attr}{sattr}', bbox))
@@ -929,6 +921,7 @@ class Matcher():
             cv2.rectangle(pairs_img, top_left, bottom_right, LINECOLOR, LINEWIDTH)
             
         # report how many cards are predicted and group bboxes by attributes
+        num_expected_matches = len(card_bboxes)
         print(f'\n{num_expected_matches} card(s) predicted:')
         predictions = {c: [crd[1] for crd in card_bboxes if crd[0] == c]
                        for c in set(p[0] for p in card_bboxes)}
@@ -940,9 +933,9 @@ class Matcher():
         
         # identify regions by comparing to card icons
         print('\nIdentifying regions...')
-        # TODO: skip icon regions that are cut off at top or bottom
         matched_cards = []
         unmatched_cards = {}
+        
         # REGULAR
         for attrs, bboxes in predictions.items():
             matched, unmatched, unmatched_rgb = self.identify_region(
@@ -1382,12 +1375,12 @@ if __name__ == '__main__':
     t0 = time.time()
     
     os.chdir(os.path.dirname(__file__))
-    ss_path = os.path.abspath('../assets/screenshots/box_test_scrolled.png')
-    # ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
+    # ss_path = os.path.abspath('../assets/screenshots/box_test_scrolled.png')
+    ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
-    # match_info = Matcher(ss_path).identify_all_images()
-    match_info = Matcher(vid_path).identify_video(vid_path)
+    match_info = Matcher(ss_path).identify_all_images()
+    # match_info = Matcher(vid_path).identify_video(vid_path)
     
     # frames = load_video_frames(vid_path)
         
