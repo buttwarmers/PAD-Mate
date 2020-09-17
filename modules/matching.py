@@ -270,12 +270,13 @@ class Matcher():
         
         # get match position
         match = find_matches(input_image, template)
-        if not match['matched']:
-            print('Unable to get bottom boundary: no match found')
-            return 1
         
         # get position of bottom boundary
-        boundary = im_h - (match['boxes'][0][1] + temp_h)
+        if not match['matched']:
+            print('Unable to get bottom boundary: no match found')
+            boundary = 1
+        else:
+            boundary = im_h - (match['boxes'][0][1] + temp_h)
         match['boundary'] = boundary
         match['temp_w'] = temp_w
         match['temp_h'] = temp_h
@@ -495,7 +496,7 @@ class Matcher():
             if matched:
                 orb_count += 1
                 attrs.append(attr)
-        print(f'Detected {orb_count} orbs: {attrs}')
+        # print(f'Detected {orb_count} orbs: {attrs}')
         return orb_count
     
     @staticmethod
@@ -758,6 +759,7 @@ class Matcher():
         
         # preprocess the image for detections
         img_gray = self.standardize_template(img_rgb, 1.0)
+        peek(img_gray)
 
         # get optimal rescale factor for resizing card & orb icons
         if self.default_scale is None:
@@ -906,13 +908,13 @@ class Matcher():
             sattr = sattr if sattr else ''
             
             # get region
-            # reg = extract_region(img, bbox, pad=0)
+            reg = extract_region(img, bbox, pad=0)
             
             # if the region is supposedly single attribute, check for orbs
-            # if not sattr:
-            #     num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
-            #     if num_orbs > 1:
-            #         continue
+            if not sattr:
+                num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
+                if num_orbs > 1:
+                    continue
             
             # store bounding box information for valid predicted regions
             card_bboxes.append((f'{attr}{sattr}', bbox))
@@ -935,6 +937,7 @@ class Matcher():
         print('\nIdentifying regions...')
         matched_cards = []
         unmatched_cards = {}
+        unmatched_rgb = {}
         
         # REGULAR
         for attrs, bboxes in predictions.items():
@@ -1237,6 +1240,7 @@ def find_matches(input_image: np.ndarray, template: np.ndarray) -> dict:
 # UTILITIES
 # =============================================================================
 def gauss_sharpen(img: np.ndarray, sigma1 = 0.5, sigma2 = 1.5) -> np.ndarray:
+    # known working values: sigma1 = 0.5, sigma2 = 1.5
     return gaussian_filter(img, sigma1) - gaussian_filter(img, sigma2)
 
 def to_numpy(image) -> np.ndarray:
@@ -1376,7 +1380,7 @@ if __name__ == '__main__':
     
     os.chdir(os.path.dirname(__file__))
     # ss_path = os.path.abspath('../assets/screenshots/box_test_scrolled.png')
-    ss_path = os.path.abspath('../assets/screenshots/box_test_medium.png')
+    ss_path = os.path.abspath('../assets/screenshots/box_test_light.png')
     vid_path = os.path.abspath('../assets/screenshots/sample_video.mp4')
     
     match_info = Matcher(ss_path).identify_all_images()

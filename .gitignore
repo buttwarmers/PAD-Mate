@@ -31,6 +31,7 @@ MANIFEST
 *.npy
 *.npz
 hidden/
+box/
 assets/converted
 assets/icons/cards
 assets/icons/card_icons.npz
