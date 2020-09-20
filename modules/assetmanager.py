@@ -520,14 +520,16 @@ class AssetManager():
             filepath = row['CardIconFilepath']
             img = imread_rgba(filepath)
             
-            # get card name
-            name = self.name_from_id(monster_id)
-            icons[name] = img
+            # store icon under monster ID string so it can be saved via .savez
+            icons[str(monster_id)] = img
             
         # save icons to npz archive (more secure than pickle)
         save_path = os.path.join(self.dirs['icons'], 'card_icons.npz')
         np.savez_compressed(save_path, **icons)
         print(f'Saved all card icons to {save_path}')
+        
+        # convert back to integer for regular use
+        icons = {int(i): icon for i, icon in icons.items()}
         
         return icons
     
@@ -538,7 +540,7 @@ class AssetManager():
             return self.compile_card_icons()
         try:
             icons_npz = np.load(load_path, allow_pickle=False)
-            icons = {name: icons_npz[name] for name in icons_npz.files}
+            icons = {int(mons_id): icons_npz[mons_id] for mons_id in icons_npz.files}
             return icons
         except Exception as ex:
             return print(f'Unable to load icons: {ex}')
@@ -558,7 +560,7 @@ class AssetManager():
         
         def stitch_icons(attributes: str):
             card_list = cards[attributes]
-            card_icons = [(name, icons[name]) for name in card_list]
+            card_icons = [(mons_id, icons[mons_id]) for mons_id in card_list]
             
             # get size of template to use
             num_icons = len(card_icons)
@@ -583,8 +585,8 @@ class AssetManager():
                     # get icon and name
                     if len(card_icons) == 0:
                         break
-                    name, icon = card_icons.pop(0)
-                    bboxes[name] = bbox
+                    monster_id, icon = card_icons.pop(0)
+                    bboxes[monster_id] = bbox
                     
                     # paste the icon WITHOUT the alpha channel
                     icons.paste(icon, bbox, mask=icon.split()[3])
@@ -781,10 +783,9 @@ class AssetManager():
             cards[f'{main}{sub}'] = []
             for i, row in group.iterrows():
                 monster_id = row['monster_id']
-                card_name = self.name_from_id(monster_id)
-                if require_icon and card_name not in icons.keys():
+                if require_icon and monster_id not in icons.keys():
                     continue
-                cards[f'{main}{sub}'].append(card_name)
+                cards[f'{main}{sub}'].append(monster_id)
                 
         if require_icon:
             self.cards_by_attributes_icons = cards
@@ -920,7 +921,8 @@ class AssetManager():
         # self.fix_portrait_sizes(redo=True)
         # self.compile_icons_by_attributes()
         # self.generate_card_icons(update=True)
-        self.compile_card_icons()
+        # self.compile_card_icons()
+        self.get_cards_by_attributes(require_icon=True)
         # icons = self.load_card_icons()
         # self.load_cards_by_attributes(require_icon=True)
         # self.generate_icon_borders()

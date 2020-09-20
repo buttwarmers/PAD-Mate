@@ -3,6 +3,7 @@
 import time
 import cv2
 import numpy as np
+from hashlib import md5
 
 # =============================================================================
 # DECORATORS
@@ -41,6 +42,12 @@ def imread_rgb(filepath: str):
 def imread_rgba(filepath:str):
     return cv2.cvtColor(cv2.imread(filepath, cv2.IMREAD_UNCHANGED), 
                         cv2.COLOR_BGRA2RGBA)
+
+# =============================================================================
+# ARRAYS
+# =============================================================================
+def array_id(array: np.ndarray):
+    return md5(array.tobytes()).hexdigest()
 
 # =============================================================================
 # LOCAL TESTING

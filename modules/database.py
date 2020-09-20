@@ -8,21 +8,32 @@ import sqlite3
 import os
 from atexit import register
 from pathlib import Path
-import time
 import re
+import numpy as np
 
-try:
-    from .utils import timeit
-except:
+if __name__ == '__main__':
     os.chdir(os.path.dirname(__file__))
     from utils import timeit
+else:
+    if os.getcwd() == os.path.dirname(__file__):
+        from utils import timeit
+    else:
+        try:
+            from modules.utils import timeit
+        except:
+            from .utils import timeit
+            
+# =============================================================================
+# GLOBALS
+# =============================================================================
+DATABASE_FOLDER = os.path.join(Path(__file__).parent.parent, 'databases', '')
+os.makedirs(DATABASE_FOLDER, exist_ok=True)
 
 # =============================================================================
 # DATABASE MANAGER
 # =============================================================================
 class Database:
     def __init__(self, 
-            src: str = None, 
             cache_limit: int = 16,
             *args, 
             **kwargs
@@ -30,19 +41,6 @@ class Database:
         
         # exit handling
         register(self._exit)
-        
-        # get source folder for database files
-        self.source_folder = self.get_source_folder() if src is None else src
-        
-        # make sure source folder is a directory and not a file
-        if os.path.isfile(self.source_folder):
-            self.source_folder = os.path.dirname(self.source_folder)
-            
-        if not os.path.exists(self.source_folder):
-            raise OSError(f'Source folder {self.source_folder} does not exist')
-            
-        # make sure source folder has trailing slash
-        self.source_folder = os.path.join(self.source_folder, '')
         
         # database file extensions
         self.valid_extensions = ('.sqlite', '.feather', '.pkl')
@@ -54,34 +52,33 @@ class Database:
         self._setup_sqlite()
         
         # set up caching
-        self.cache_limit = cache_limit
-        self.reset_cache()
+        self._cache_limit = cache_limit
+        self._reset_cache()
         
         # class variables
-        self.dataframes = None
+        self.dataframes = self.load_dataframes()
         
-# =============================================================================
-# CHECK FOR REQUIRED FILES
-# =============================================================================
+    # =============================================================================
+    # CHECK FOR REQUIRED FILES
+    # =============================================================================
     def get_source_folder(self):
         parent = Path(os.path.dirname(__file__)).parent
         return os.path.join(parent, 'databases', '')
     
     def get_source_files(self):
-        folder = self.get_source_folder()
-        files = [os.path.join(folder, f) for f in os.listdir(folder) 
+        files = [os.path.join(DATABASE_FOLDER, f) for f in os.listdir(DATABASE_FOLDER) 
                  if f.endswith(self.valid_extensions)]
         if not files:
             raise ValueError('No database files found in {folder}')
         return files
         
-# =============================================================================
-# SQLITE
-# =============================================================================
+    # =============================================================================
+    # SQLITE
+    # =============================================================================
     @timeit
     def load_sqlite(self, sqlite_file: str = None) -> sqlite3.Connection:
         if sqlite_file is None:
-            sqlite_file = os.path.join(self.source_folder, 'pad.sqlite')
+            sqlite_file = os.path.join(DATABASE_FOLDER, 'pad.sqlite')
         if not os.path.exists(sqlite_file):
             raise OSError(f'sqlite database file {sqlite_file} not found')
         return sqlite3.connect(sqlite_file)
@@ -114,19 +111,20 @@ class Database:
         self.sqlite = self.load_sqlite()
         self.sqlite_tables = self.get_sqlite_tables()
         
-# =============================================================================
-# SAVING AND LOADING DATAFRAMES
-# =============================================================================
+    # =============================================================================
+    # SAVING AND LOADING DATAFRAMES
+    # =============================================================================
     def dataframe_from_table(self, table: str) -> pd.DataFrame:
         if table in self.sqlite_tables:
             return pd.read_sql_query(f'select * from {table}', self.sqlite)
         else:
             print(f'{table} not found in sqlite tables:')
-            self._print_items(self.sqlite_tables)
+            self.print_items(self.sqlite_tables)
             
-    def dataframe_from_file(self, name: str) -> pd.DataFrame:
+    @staticmethod
+    def dataframe_from_file(name: str) -> pd.DataFrame:
         filename = name.split('.')[0] + '.feather'
-        filepath = os.path.join(self.source_folder, filename)
+        filepath = os.path.join(DATABASE_FOLDER, filename)
         if not os.path.exists(filepath):
             return print(f'{filepath} does not exist')
         return pd.read_feather(filepath)
@@ -135,6 +133,7 @@ class Database:
     def load_dataframes(self) -> dict:
         dfs = {t: self.dataframe_from_file(t) for t in self.sqlite_tables}
         self.dataframes = dfs
+        self.fix_na_names()
         return self.dataframes
         
     @timeit
@@ -154,19 +153,19 @@ class Database:
     @timeit
     def save_dataframes(self) -> None:
         for k, v in self.dataframes.items():
-            filepath = os.path.join(self.source_folder, f'{k}.feather')
+            filepath = os.path.join(DATABASE_FOLDER, f'{k}.feather')
             # cannot feather non-default indices so reset index to default
             v.reset_index(inplace=True, drop=True) 
             v.to_feather(filepath)
         print('Saved dataframes')
     
-# =============================================================================
-# SEARCHING DATAFRAMES
-# =============================================================================
+    # =============================================================================
+    # GENERIC DATAFRAME SEARCHING
+    # =============================================================================
     def df_by_name(self, df_name: str) -> pd.DataFrame:
         if df_name not in self.dataframes.keys():
             print(f'{df_name} not in dataframes:')
-            self._print_items(self.dataframes.keys())
+            self.print_items(self.dataframes.keys())
             return
         return self.dataframes[df_name]
 
@@ -203,7 +202,7 @@ class Database:
         for column, (comparison, value) in terms.items():
             if comparison not in valid_comparisons:
                 print(f'Comparison {comparison} is not valid:')
-                self._print_items(valid_comparisons)
+                self.print_items(valid_comparisons)
                 continue
             df = self.apply_mask(df, column, comparison, value, use_regex)
             
@@ -211,7 +210,7 @@ class Database:
             
     @timeit
     def filter_dataframe(self, df_name, use_regex: bool = True, **kwargs):
-        return self.cache(self._filter_dataframe, df_name, use_regex, **kwargs)
+        return self._cache(self._filter_dataframe, df_name, use_regex, **kwargs)
             
     def apply_mask(self, 
            df: pd.DataFrame, 
@@ -248,13 +247,32 @@ class Database:
             print(f'Could not filter dataframe: {ex}')
             return df
        
-# =============================================================================
-# CACHING
-# =============================================================================
-    def reset_cache(self) -> None:
-        self.cached = {}
+    def fix_na_names(self):
+        df = self.dataframes['monsters']
+        df['name_na'] = np.where(df['name_na_override'].isna(), df['name_na'],
+                                 df['name_na_override'])
+        self.dataframes['monsters'] = df
+        return df
+       
+    # =============================================================================
+    # SPECIALIZED SEARCH FUNCTIONS
+    # =============================================================================
+    def name_from_id(self, monster_id: int, region: str='na') -> str:
+        df = self.dataframes['monsters']
+        res = df[df['monster_id'] == monster_id][f'name_{region}'].values
+        return res[0] if res else print(f'Name not found for ID {monster_id}')
+    
+    def names_from_ids(self, monster_ids: list) -> list:
+        df = self.dataframes['monsters']
+        return list(df[df['']])
+       
+    # =============================================================================
+    # CACHE
+    # =============================================================================
+    def _reset_cache(self) -> None:
+        self._cached = {}
         
-    def cache(self, func, *args, **kwargs):
+    def _cache(self, func, *args, **kwargs):
         name = func.__name__
         
         # store args in kwargs
@@ -265,38 +283,39 @@ class Database:
         
         # check for cached results and return them if they exist
         cached_results = None
-        if name in self.cached.keys():
-            cached_results = self.cached[name]
+        if name in self._cached.keys():
+            cached_results = self._cached[name]
             if uuid in cached_results.keys():
                 print('Using cached results')
-                return self.cached[name][uuid]
+                return self._cached[name][uuid]
             
         # make sure number of results doesn't exceed cache size limit
         if cached_results is None:
-            self.cached[name] = {}
-        elif len(cached_results.keys() > self.cache_limit):
+            self._cached[name] = {}
+        elif len(cached_results.keys() > self._cache_limit):
             oldest_entry = list(cached_results.keys())[0]
-            self.cached[name].pop(oldest_entry)
+            self._cached[name].pop(oldest_entry)
             
         # store cached result
         result = func(*args, **kwargs)
-        self.cached[name].update({uuid: result})
+        self._cached[name].update({uuid: result})
         
         return result
         
-# =============================================================================
-# UTILS    
-# =============================================================================
+    # =============================================================================
+    # UTILS    
+    # =============================================================================
     def _exit(self) -> None:
         self.close_sqlite()
         self.save_dataframes()
         
-    def _print_items(self, items: list) -> None:
+    @staticmethod
+    def print_items(items: list) -> None:
         [print(f'\t{i}') for i in items]
         
     def _column_not_found(self, df: pd.DataFrame, column: str) -> None:
         print(f'Column {column} not in dataframe columns:')
-        self._print_items(df.columns)
+        self.print_items(df.columns)
         
     def _freeze_dict(self, dictionary: dict) -> tuple:
         return frozenset(dictionary.items())
@@ -310,17 +329,15 @@ class Database:
         #     'name_na': ('==', 'Tyrra')
         #     }
         # res = self.filter_dataframe('monsters', **kwargs)
-        self._print_items(self.dataframes['monsters'].columns)
+        self.print_items(self.dataframes['monsters'].columns)
+        fixed = self.fix_na_names()
+        return fixed
         
 # =============================================================================
 # LOCAL RUNNING
 # =============================================================================
 if __name__ == '__main__':
-    @timeit
-    def main():
-        db = Database()
-        db._test()
-        db._exit()
-        
-    main()
+    db = Database()
+    fixed = db._test()
+    db._exit()
     
