@@ -32,6 +32,9 @@ MANIFEST
 *.npz
 hidden/
 box/
+users/
+profiles/
+modules/redditbot.py
 assets/converted
 assets/icons/cards
 assets/icons/card_icons.npz

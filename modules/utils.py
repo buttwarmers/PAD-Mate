@@ -4,15 +4,17 @@ import time
 import cv2
 import numpy as np
 from hashlib import md5
+import pandas as pd
+from ast import literal_eval
 
 # =============================================================================
 # DECORATORS
 # =============================================================================
 def timeit(func, *args, **kwargs):
     def wrap(*args, **kwargs):
-        t0 = time.time()
+        t = time.time()
         result = func(*args, **kwargs)
-        print(f'\n({func.__name__} finished in {time.time()-t0:.4f} seconds)\n')
+        print(f'\n({func.__name__} finished in {time.time()-t:.4f} seconds)\n')
         return result
     return wrap
 
@@ -48,6 +50,16 @@ def imread_rgba(filepath:str):
 # =============================================================================
 def array_id(array: np.ndarray):
     return md5(array.tobytes()).hexdigest()
+
+# =============================================================================
+# DATAFRAMES
+# =============================================================================
+def eval_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.convert_dtypes()
+    for col in df.columns:
+        try: df.loc[:, col] = df[col].map(literal_eval)
+        except: pass
+    return df
 
 # =============================================================================
 # LOCAL TESTING

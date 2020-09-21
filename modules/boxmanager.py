@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 
+'''
+The BoxManager is responsible for keeping track of which images have already
+been identified by the Matcher, identity of regions within those images, and
+the resulting box, which is a pared-down list of matched cards with duplicates
+removed.
+'''
 # =============================================================================
 # IMPORTS
 # =============================================================================
@@ -9,17 +15,22 @@ from pathlib import Path
 import numpy as np
 import itertools
 import math
-import ast
 
 if __name__ == '__main__':
-    os.chdir((Path(__file__).parent))
+    os.chdir(Path(__file__).parent)
+    from user import User
     from database import Database as db
+    from utils import eval_dtypes
     
 else:
     try:
+        from modules.user import User
         from modules.database import Database as db
+        from modules.utils import eval_dtypes
     except ImportError:
+        from user import User
         from database import Database as db
+        from utils import eval_dtypes
 
 # =============================================================================
 # GLOBALS
@@ -27,6 +38,7 @@ else:
 BOX_FOLDER = os.path.join(Path(__file__).parent.parent, 'box', '')
 os.makedirs(BOX_FOLDER, exist_ok=True)
 
+DEFAULT_USER = 'test'
 EMPTY_BOX = np.empty(0, dtype = np.dtype([
                                     ('monster_id', 'uint8'),
                                     ('source_id', str),
@@ -37,26 +49,25 @@ EMPTY_BOX = np.empty(0, dtype = np.dtype([
 # BOX MANAGER CLASS
 # =============================================================================
 class BoxManager:
-    def __init__(self, box_name: str = 'box'):
-        self.box_name = box_name
-        self.box_file = os.path.join(BOX_FOLDER, f'{self.box_name}.csv')
-        self.box = self.load_box()
+    def __init__(self, username: str = DEFAULT_USER):
+        self.box_filepath = User.get_box_filepath(username)
+        self.box = self.load()
         self._box = self.box
         self.db = db()
 
     # =============================================================================
     # LOADING / SAVING BOX AND MATCHES
     # =============================================================================
-    def load_box(self) -> pd.DataFrame:
-        if not os.path.exists(self.box_file):
-            print(f'Box file {self.box_file} does not exist: creating empty box...')
+    def load(self) -> pd.DataFrame:
+        if not os.path.exists(self.box_filepath):
+            print(f'{self.box_filepath} does not exist: creating empty box...')
             return self.new_box()
         try:
-            self.box = pd.read_csv(self.box_file)
+            self.box = pd.read_csv(self.box_filepath)
             self.fix_dtypes()
             return self.box
         except:
-            print(f'Unable to load box from {self.box_file}: making new box...')
+            print(f'Unable to load box from {self.box_filepath}: making new box...')
             return self.new_box()
         
     def import_box(self, box: pd.DataFrame) -> None:
@@ -68,13 +79,13 @@ class BoxManager:
         self.process_frames()
         self.fix_dtypes()
         
-    def save_box(self) -> None:
-        self.box.reset_index(drop=True).to_csv(self.box_file, index=False)
-        print(f'Saved box to {self.box_file}')
+    def save(self) -> None:
+        self.box.to_csv(self.box_filepath, index=False)
+        print(f'Saved box to {self.box_filepath}')
         
     def new_box(self) -> pd.DataFrame:
         self.box = pd.DataFrame(EMPTY_BOX)
-        self.save_box()
+        self.save()
         return self.box
     
     # =============================================================================
@@ -83,7 +94,7 @@ class BoxManager:
     def update_box(self, new: pd.DataFrame) -> None:
         pass
     
-    def identify_dupes(self) -> pd.DataFrame:
+    def drop_dupes(self) -> pd.DataFrame:
         # remove identical matches (same bounding box and source frame)
         df = self.box.drop_duplicates(subset=['source_id', 'bbox'])
         
@@ -150,7 +161,13 @@ class BoxManager:
                     df.loc[((df['source_id'] == drop_id) & 
                             (df['monster_id'] == card)), 'duplicate'] = True
 
-        self.box = df
+        self.box = df[df['duplicate'] == False]
+        self.box.drop(columns='duplicate', inplace=True)
+        
+    # =============================================================================
+    # MANAGING CARDS
+    # =============================================================================
+    
     
     # =============================================================================
     # PROPERTIES
@@ -163,7 +180,7 @@ class BoxManager:
     def box(self, box: pd.DataFrame) -> None:
         if isinstance(box, pd.DataFrame):
             self._box = box
-    
+            
     @property
     def size(self) -> int:
         return len(self.box[self.box['duplicate'] == False])
@@ -239,12 +256,7 @@ class BoxManager:
         return pd.Series([item for x in range(mask.sum())], index=mask.index)
     
     def fix_dtypes(self):
-        self.box = self.box.convert_dtypes()
-        for col in self.box.columns:
-            try:
-                self.box.loc[:, col] = self.box[col].map(ast.literal_eval)
-            except:
-                pass
+        self.box = eval_dtypes(self.box)
     
     # =============================================================================
     # BUILT-INS

@@ -58,6 +58,9 @@ class Database:
         # class variables
         self.dataframes = self.load_dataframes()
         
+        # close sqlite file
+        self.close_sqlite()
+        
     # =============================================================================
     # CHECK FOR REQUIRED FILES
     # =============================================================================
@@ -320,6 +323,14 @@ class Database:
     def _freeze_dict(self, dictionary: dict) -> tuple:
         return frozenset(dictionary.items())
         
+    # =============================================================================
+    # UPDATING FROM SQL FILE
+    # =============================================================================
+    def update(self):
+        self.update_dataframes()
+        self.save_dataframes()
+        print('Updated dataframes from sqlite database')
+    
 # =============================================================================
 # TESTING
 # =============================================================================
@@ -338,6 +349,7 @@ class Database:
 # =============================================================================
 if __name__ == '__main__':
     db = Database()
-    fixed = db._test()
+    # fixed = db._test()
+    db.update()
     db._exit()
     

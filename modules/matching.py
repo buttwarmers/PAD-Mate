@@ -16,11 +16,13 @@ import math
 try:
     from .assetmanager import AssetManager
     from .boxmanager import BoxManager
+    from user import User
     from .utils import timeit, pt_sep, imread_rgb, array_id
 except:
     os.chdir(os.path.dirname(__file__))
     from assetmanager import AssetManager
     from boxmanager import BoxManager
+    from user import User
     from utils import timeit, pt_sep, imread_rgb, array_id
 
 # =============================================================================
@@ -48,7 +50,6 @@ INTERPOLATION = cv2.INTER_LANCZOS4 # cv2.INTER_CUBIC
 LINEWIDTH = 5
 OFFSET_LINEWIDTH = True
 LINECOLOR = (0, 255, 255)
-DEFAULT_SCALE = 1.0
 READ_MODE = cv2.IMREAD_UNCHANGED
 FONT = cv2.FONT_HERSHEY_PLAIN
 FONT_SCALE = 2.5
@@ -59,6 +60,7 @@ NO_PEEK = False
 DEBUG = False
 ROW_OVERLAP = 0
 SAVE_CONFIDENCE_MAPS = False
+DEFAULT_USER = 'test'
 
 # =============================================================================
 # MAIN MATCHING CLASS
@@ -67,83 +69,77 @@ class Matcher():
     def __init__(
             self, 
             inputs: list,
-            box_name: str = 'box',
-            default_scale: float = None,
-            orb_crop_factor: float = 0.15, # 0.15 default
+            username: str = DEFAULT_USER,
             **kwargs
             ) -> dict:
         
         # store input variables
-        self.default_scale = default_scale
-        self.orb_crop_factor = orb_crop_factor
-        self.box_name = box_name
+        self.username = username
+        
+        # load user info
+        self.change_user(username)
+        
+        # load box
+        self.box_manager = BoxManager(self.username)
+        self.box = self.box_manager.box
         
         # store empty variables
         self.matched_cards = []
-        self.matched_frames = []
-        self.box_bottom_boundary = 1
         self.bottom_boundary_info = None
-        self.box_top_boundary = 0
-        
-        # load box
-        self.box_manager = BoxManager(self.box_name)
-        self.box = self.box_manager.box
-        
-        # parse the input images
-        self.inputs = self.add_inputs(inputs)
-        tot_inputs = 0
-        for fmt, media_types in self.inputs.items():
-            for media_type, media_list in media_types.items():
-                tot_inputs += len(media_list)
-            
-        if tot_inputs == 0:
-            return print('No valid inputs provided')
         
         # initialize the asset manager and load required assets
         self._load_required_assets()
         
-    def add_inputs(self, inputs: list):
-        inputs = [inputs] if not isinstance(inputs, list) else inputs
-        vid_exts = ('.mp4', 'mp3', '.gif', '.mkv', '.mov', '.webm', '.avi', '.ogg')
-        img_exts = ('.png', '.jpg', '.jpeg', '.tiff', '.bmp')
-        parsed = {
-            'files': {
-                'images': [],
-                'videos': [],
-                },
-            'frames': {
-                'images': [],
-                'videos': [],
-                },
-            'urls': {
-                'images': [],
-                'videos': [],
-                },
-            }
-        for item in inputs:
-            if isinstance(item, str):
-                if not os.path.exists(item):
-                    print(f'{item} does not exist')
-                    continue
-                elif item.lower().endswith(vid_exts):
-                    if item not in parsed['files']['videos']:
-                        parsed['files']['videos'].append(item)
-                    continue
-                elif item.lower().endswith(img_exts):
-                    if item not in parsed['files']['images']:
-                        parsed['files']['images'].append(item)
-                else:
-                    # TODO: add/validate URLs
-                    pass
-            elif isinstance(item, np.ndarray):
-                if item.ndim == 4:
-                    parsed['frames']['videos'].append(item)
-                else:
-                    parsed['frames']['images'].append(item)
-                # img = imread_rgb(item)
-                # TODO: handle URLs
-            # img = to_numpy(img)
-        return parsed
+    # =============================================================================
+    # USER OPERATIONS
+    # =============================================================================
+    def change_user(self, username: str) -> None:
+        # load user
+        self.user = User(username)
+        
+        # load config options
+        cfg = self.user.config['Matching']
+        self.box_top_boundary = cfg.get('box_top_boundary', 0)
+        self.box_bottom_boundary = cfg.get('box_bottom_boundary', 1)
+        self.rows_per_page = cfg.get('rows_per_page', None)
+        self.scale = cfg.get('scale', None)
+        self.scroll_bbox = cfg.get('scroll_bbox', None)
+        self.orb_crop_factor = cfg.get('orb_crop_factor', 0.15)
+        self.icon_w = cfg.get('icon_w', None)
+        self.icon_h = cfg.get('icon_h', None)
+        
+        # load media
+        self.images = self.user.images
+        self.videos = self.user.videos
+        self.urls = self.user.urls
+        
+        # load matches
+        self.matches = self.user.matches
+        
+        print(f'Loaded user \"{username}\"')
+        
+    def save_config(self):
+        # update config entries
+        self.user.config['Matching']['box_top_boundary'] = self.box_top_boundary
+        self.user.config['Matching']['box_bottom_boundary'] = self.box_bottom_boundary
+        self.user.config['Matching']['rows_per_page'] = self.rows_per_page
+        self.user.config['Matching']['scale'] = self.scale
+        self.user.config['Matching']['scroll_bbox'] = self.scroll_bbox
+        self.user.config['Matching']['orb_crop_factor'] = self.orb_crop_factor
+        self.user.config['Matching']['icon_w'] = self.icon_w
+        self.user.config['Matching']['icon_h'] = self.icon_h
+        
+        # save config
+        self.user.save_config()
+    
+    def save_matches(self):
+        self.user.matches = self.matches
+        self.user.save_matches()
+    
+    def save_user(self):
+        self.save_config()
+        self.save_matches()
+        print(f'Saved user info for {self.username}')
     
     # =============================================================================
     # STATIC METHODS
@@ -189,15 +185,44 @@ class Matcher():
         return template
     
     @staticmethod
+    def is_cutoff(icon: np.ndarray):
+        short, long = sorted(list(icon.shape[0:2]))
+        try: return abs(short / long) < 0.9
+        except: return False
+        
+    @staticmethod
+    def trim_image(
+            image: np.ndarray,
+            top: int = 0,
+            bottom: int = 1,
+            left: int = 0,
+            right: int = 1
+            ) -> np.ndarray:
+        try:
+            return image[top:-bottom, left:-right]
+        except:
+            print(f'Could not trim image using {(top, bottom, left, right)}')
+            return image
+
+    @staticmethod
     def get_match_dataframe(match_list: list) -> pd.DataFrame:
         if isinstance(match_list, dict):
-            return pd.DataFrame.from_dict(match_list, orient='index')
+            match_list = [match_list]
         if not isinstance(match_list, list):
             print(f'get_match_data expects a list, not {type(match_list)}')
             return match_list
-        cleaned = [{k: v for k, v in match.items() if not 
-                    isinstance(v, (np.ndarray, dict))} for match in match_list]
-        return pd.DataFrame.from_dict(cleaned)
+        
+        # don't store dictionaries or numpy arrays in the dataframe
+        def skip(item) -> bool:
+            return isinstance(item, np.ndarray) or isinstance(item, dict)
+        cleaned = [{k: v for k, v in match.items() if not skip(v)}
+                   for match in match_list]
+        
+        # convert to dataframe and remove duplicate entries
+        df = pd.DataFrame.from_dict(cleaned)
+        df = df.drop_duplicates(subset=['source_id', 'bbox'], keep='last')
+        
+        return df
                             
     @staticmethod
     def get_matched_cards(match_list: list):
@@ -225,31 +250,7 @@ class Matcher():
                 unmatched.append((attr, region))
         print(f'Number of unmatched regions: {len(unmatched)}')
         return unmatched
-    
-    @staticmethod
-    def is_cutoff(icon: np.ndarray):
-        short, long = sorted(list(icon.shape[0:2]))
-        try: return abs(short / long) < 0.9
-        except: return False
-    
-    # =============================================================================
-    # CLASS METHODS
-    # =============================================================================
-    @classmethod
-    def trim_image(
-            cls,
-            image: np.ndarray,
-            top: int = 0,
-            bottom: int = 1,
-            left: int = 0,
-            right: int = 1
-            ) -> np.ndarray:
-        try:
-            return image[top:-bottom, left:-right]
-        except:
-            print(f'Could not trim image using {(top, bottom, left, right)}')
-            return image
-        
+
     # =============================================================================
     # IMAGE UTILITIES
     # =============================================================================
@@ -258,7 +259,7 @@ class Matcher():
                                bottom = self.box_bottom_boundary)
     
     # =============================================================================
-    # PROTECTED FUNCTIONS
+    # PRIVATE FUNCTIONS
     # =============================================================================
     @timeit
     def _load_required_assets(self):
@@ -305,7 +306,6 @@ class Matcher():
     def find_bottom_boundary(
             self,
             input_image: np.ndarray,
-            scale: float
             ) -> int:
         
         # get input dimensions
@@ -317,7 +317,7 @@ class Matcher():
             return {'boundary': self.box_bottom_boundary}
         
         # resize the template based on the known scaling factor
-        template = rescale(template, (100/164)*scale) # 100/164
+        template = rescale(template, (100/164)*self.scale) # 100/164
         temp_h, temp_w = template.shape[0:2]
         
         # get match position
@@ -345,21 +345,20 @@ class Matcher():
     def get_scrollbar_info(
             self,
             input_image: np.ndarray,
-            scale: float,
-            scroll_bbox: tuple = None,
             ) -> tuple:
         
-        # make sure bottom boundary info exists
-        if self.bottom_boundary_info is None:
-            self.bottom_boundary_info = self.find_bottom_boundary(input_image, scale)
-        
         # skip matching if the region is already known
-        if scroll_bbox is not None and self.cards_text_template is not None:
-            (tl_x, tl_y), (br_x, br_y) = scroll_bbox
+        if self.scroll_bbox is not None and self.cards_text_template is not None:
+            (tl_x, tl_y), (br_x, br_y) = self.scroll_bbox
         
         else:
+            # make sure bottom boundary info exists
+            if self.bottom_boundary_info is None:
+                self.bottom_boundary_info = self.find_bottom_boundary(input_image)
+                
+            # get template dimensions
             ctxt_h, ctxt_w = self.cards_text_template.shape[0:2]
-            ctxt_h, ctxt_w = ctxt_h*scale*(100/164), ctxt_w*scale*(100/164)
+            ctxt_h, ctxt_w = ctxt_h*self.scale*(100/164), ctxt_w*self.scale*(100/164)
             
             # get scrollbar boundary using some hacky relative position bullshit
             _info = self.bottom_boundary_info
@@ -369,13 +368,13 @@ class Matcher():
             br_y = int(_tl_y - (10/52)*ctxt_h) # 10/52
             tl_x = int(br_x - (47/140)*ctxt_w) # 41/140
             tl_y = int(self.box_top_boundary + (136/52)*ctxt_h) # 136/52
+            self.scroll_bbox = ((tl_x, tl_y), (br_x, br_y))
         
         # show the region
         scroll_region = input_image[tl_y:br_y, tl_x:br_x]
         
         # analyze the scrollbar region
         scroll_info = self.analyze_scrollbar(scroll_region)
-        scroll_info['scrollbar_bbox'] = (tl_x, tl_y), (br_x, br_y)
         return scroll_info
         
     def analyze_scrollbar(
@@ -500,12 +499,11 @@ class Matcher():
             self, 
             region: np.ndarray, 
             orbs: dict = None,
-            scale: float = None,
             standardize: bool = True
             ) -> bool:
         
-        # check if the region contains an orb
-        scale = self.default_scale if scale is None else scale
+        # check how many orbs the region contains
+        scale = self.scale
         if orbs is None:
             orbs = {k: self.standardize_template(v, scale) 
                     for k, v in self.orb_icons.items()}
@@ -520,7 +518,6 @@ class Matcher():
             if matched:
                 orb_count += 1
                 attrs.append(attr)
-        # print(f'Detected {orb_count} orbs: {attrs}')
         return orb_count
     
     @staticmethod
@@ -585,7 +582,6 @@ class Matcher():
     def identify_assists(
             self,
             input_image: np.ndarray,
-            scale: float,
             standardize: bool = False
             ) -> bool:
         
@@ -593,7 +589,7 @@ class Matcher():
         template = self.assisting_template
         if template is None:
             return {'matched': False}
-        template = rescale(template, (100/164)*scale)
+        template = rescale(template, (100/164)*self.scale)
         
         # standardize image if necessary
         if standardize:
@@ -601,8 +597,7 @@ class Matcher():
         
         # check for match
         assist_info = find_matches(input_image, template)
-        assisting = assist_info['matched']
-        assist_info['name'] = 'Assisting'
+        assist_info['name'] = 'Assisting' if assist_info['matched'] else 'Unknown'
         
         return assist_info
     
@@ -613,7 +608,6 @@ class Matcher():
             attributes: str,
             bboxes: tuple,
             icons: dict, 
-            scale: float,
             offsets: tuple,
             ):
         
@@ -639,7 +633,7 @@ class Matcher():
             card_icon = icons.get(monster_id, None)
             if card_icon is None:
                 continue
-            card_icon = self.standardize_template(card_icon, scale)
+            card_icon = self.standardize_template(card_icon, self.scale)
             card_icon = self.crop_icon(card_icon, offsets)
             
             # check for a match against all regions
@@ -653,8 +647,10 @@ class Matcher():
                     continue
                 
                 # check if region is assisting
-                assist_info = self.identify_assists(region, self.default_scale)
+                assist_info = self.identify_assists(region)
                 if assist_info['matched']:
+                    assist_info['bbox'] = bbox
+                    assist_info['offsets'] = offsets
                     matched_cards.append(assist_info)
                     unmatched_regions.remove(bbox)
                     continue
@@ -691,60 +687,67 @@ class Matcher():
     @timeit
     def identify_video(
             self,
-            video_filepath: str,
-            assists_ok: bool = False
+            filepath: str,
+            assists_ok: bool = False,
+            update: bool = True
             ) -> list:
         
-        # load video info
-        frames = load_video_frames(video_filepath)
-        num_frames = frames.shape[0]
-        print(f'Number of frames: {num_frames}')
+        # make sure file exists
+        if not os.path.exists(filepath):
+            return print(f'{filepath} does not exist')
         
-        # identify the first frame to get info
+        # check if the file has already been analyzed
+        if filepath in self.matches['source_filepath'].values:
+            if not update:
+                return self.matches[self.matches['source_filepath'] == filepath]
+        
+        # get required video frames
+        cap = cv2.VideoCapture(filepath)
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_num = -1
+        has_data = True
         frame_info = {}
-        bad_frames = []
-        for i in range(num_frames):
-            result = self.identify_frame(frames[i], source_frame=i,
-                                         source_filepath=video_filepath,
-                                         analyze_scrollbar=True,
-                                         assists_ok=assists_ok)
-            if result is not None:
-                first_match, first_frame_info = result
-                if len(first_match) == 0 and len(first_frame_info) == 0:
-                    bad_frames.append(i)
-                    continue
-                frame_info[i] = first_frame_info
-                break
-            else:
-                bad_frames.append(i)
-            
-        # get scrollbar info for each frame
-        scale = frame_info.get('scale', self.default_scale)
-        scroll_bbox = frame_info.get('bbox', None)
         scroll_info = {}
-        
-        # skip frames that have assists, if option is chosen
-        if not assists_ok:
-            for i in [f for f in range(num_frames) if f not in bad_frames]:
-                im = self.standardize_input_image(frames[i])
-                im = self.trim_to_box(im)
-                im = self.standardize_template(im, 1.0)
-                assist_info = self.identify_assists(im, scale)
-                if assist_info['matched']:
-                    bad_frames.append(i)
-                    print(f'Frame {i} has assists')
-        
-        # TODO: split into batches for multiprocessing
-        print('Getting scrollbar info...')
-        for i in [f for f in range(num_frames) if f not in bad_frames]:
-            frame = self.standardize_input_image(frames[i])
-            scroll_info[i] = self.get_scrollbar_info(frame, scale, scroll_bbox)
+        bad_frames = []
+        matches = []
+        while frame_num < num_frames - 1 and has_data:
+            frame_num += 1
+            print(f'Checking frame {frame_num}/{num_frames}...')
+            has_data, raw = cap.read()
+            rgb = to_rgb(raw)
+            if len(frame_info) == 0:
+                result = self.identify_frame(rgb, source_frame=frame_num,
+                                             source_filepath=filepath,
+                                             analyze_scrollbar=True,
+                                             assists_ok=assists_ok)
+                if result is not None:
+                    first_match, first_frame_info = result
+                    if len(first_match) == 0 and len(first_frame_info) == 0:
+                        bad_frames.append(frame_num)
+                        continue
+                    matches.append(first_match)
+                    frame_info[frame_num] = first_frame_info
+                continue
+                
+            # check for assists
+            elif not assists_ok:
+                frame = self.standardize_input_image(rgb)
+                frame = self.trim_to_box(frame)
+                frame = self.standardize_template(frame, 1.0)
+                assist_info = self.identify_assists(frame)
+                if assist_info.get('matched', False):
+                    bad_frames.append(frame_num)
+                    continue
             
-        # remove rows with no data
+            # get scrollbar info
+            frame = self.standardize_input_image(rgb)
+            scroll_info[frame_num] = self.get_scrollbar_info(frame)
+            
+        # remove frames with no data
         df = pd.DataFrame.from_dict(scroll_info, orient='index')
         df = df[df['matched_scrollbar'] == True]
         
-        # remove outliers
+        # remove outlier frames
         med, std = df['handle_height'].median(), df['handle_height'].std()
         mask = ((abs(df['handle_height'] - med) < 5) | 
                 (df['handle_height'] > med - 0.3*std) & 
@@ -759,7 +762,6 @@ class Matcher():
         
         # remove more duplicates
         df.sort_values(by=['page_num', 'num_full_rows'], inplace=True, ascending=True)
-        # return df, df
         
         # find all frames to use - always use the top and bottom of box
         selected = df.head(1)
@@ -774,22 +776,21 @@ class Matcher():
         selected = pd.concat([selected, df.tail(1)])
         selected = selected[~selected.index.duplicated()]
         
-        # return df
-            
-        # clear unnecessary frames from memory
-        frames = {i: frames[i] for i in selected.index if i not in frame_info.keys()}
-            
-        # get match info for all selected frames
-        print(f'Selected {len(selected)} frames for analysis')
-        matches = []
-        for i, frame in frames.items():
-            match_info, frm = self.identify_frame(frame, source_frame=i, 
-                                                  source_filepath=video_filepath,
-                                                  scroll_info=scroll_info[i])
+        # analyze the selected frames
+        print(f'\nSelected {len(selected)} frames for analysis\n')
+        for frame_num in [i for i in selected.index if i not in frame_info.keys()]:
+            print(f'Identifying matches in frame {frame_num}')
+            cap.set(1, frame_num)
+            _, frame = cap.read()
+            frame = to_rgb(frame)
+            match_info = self.identify_frame(frame, source_frame=frame_num,
+                                                  source_filepath=filepath,
+                                                  scroll_info=scroll_info[frame_num])
             matches.append(match_info)
-            frame_info[i] = frm
             
-        return matches, frame_info
+        # convert to dataframe
+        match_data = self.get_match_dataframe(matches)
+        return match_data
     
     # =============================================================================
     # IDENTIFY IMAGE
@@ -798,10 +799,13 @@ class Matcher():
     def identify_image(
         self,
         source,
+        update: bool = True
         ) -> tuple:
-        matches, info = self.identify_frame(source, analyze_scrollbar=True,
-                                            source_frame=1)
-        return matches, info
+        
+        # identifying a standalone screenshot, not part of video identification
+        match_data = self.identify_frame(source, analyze_scrollbar=True,
+                                         source_frame=1, update=update)
+        return match_data
 
     # =============================================================================
     # GENERIC FRAME IDENTIFICATION
@@ -816,6 +820,7 @@ class Matcher():
             source_filepath: str = None,
             scroll_info: dict = {},
             assists_ok: bool = True,
+            update: bool = True
             ):
         
         # load the image if it's a filepath
@@ -828,6 +833,16 @@ class Matcher():
             rgb_image = source
         else:
             return print(f'Error: source type {type(source)} is invalid')
+        
+        # get source ID
+        source_id = array_id(rgb_image)
+        
+        # check if it's already been analyzed
+        if (source_filepath in self.matches['source_filepath'].values or
+            source_id in self.matches['source_id'].values) and not update:
+            mask = ((self.matches['source_filepath'] == source_filepath) |
+                    (self.matches['source_id'] == source_id))
+            return self.matches[mask]
         
         # make sure icons were loaded
         icons = self.card_icons
@@ -845,42 +860,41 @@ class Matcher():
         img_gray = self.standardize_template(img_rgb, 1.0)
 
         # get optimal rescale factor for resizing card & orb icons
-        if self.default_scale is None or self.box_top_boundary is None:
+        if self.scale is None or self.box_top_boundary is None:
             std_temp = self.standard_template
             scale, info = get_best_scale(img_gray, std_temp)
-            self.default_scale = scale
+            self.scale = scale
             
             # get the top boundary of the box region
             try:
                 _h, _dh = info['boxes'][0][1], info['template_height']
                 self.box_top_boundary = _h + _dh
             except:
-                self.box_top_boundary = 0
+                pass
             
         else:
-            scale = self.default_scale
+            scale = self.scale
             
         # get new dimensions based on optimal rescale factor
         icon_w, icon_h = (int(scale*orig_w), int(scale*orig_h))
-        print(f'Icon dimensions: ({icon_w}, {icon_h})')
         
         # store icon dimensions for access in other functions
         self.icon_w, self.icon_h = icon_w, icon_h
             
         # get the position of the bottom boundary
         if self.box_bottom_boundary == 1 or self.bottom_boundary_info is None:
-            self.bottom_boundary_info = self.find_bottom_boundary(img_gray, scale)
+            self.bottom_boundary_info = self.find_bottom_boundary(img_gray)
         
         # get scrollbar position
         if analyze_scrollbar:
-            scroll_info = self.get_scrollbar_info(img_rgb, scale)
+            scroll_info = self.get_scrollbar_info(img_rgb)
             
         # trim the image to just the monster box so matching is faster
         img = self.trim_to_box(img_gray)
         img_rgb = self.trim_to_box(img_rgb)
         
         # check if there are assist cards in the frame
-        assist_info = self.identify_assists(img, scale)
+        assist_info = self.identify_assists(img)
         if assist_info['matched'] and not assists_ok:
             print('Skipping: assists detected...')
             return [], {}
@@ -896,7 +910,6 @@ class Matcher():
         dh0, dh1 = (0, 1) if (dh0 + dh1) >= icon_h else (dh0, dh1)
         dw0, dw1 = (0, 1) if (dw0 + dw1) >= icon_w else (dw0, dw1)
         icon_offsets = ((dw0, dw1), (dh0, dh1))
-        print(f'Icon offsets: {icon_offsets}')
         
         # fix orb icons
         orbs = {k: self.standardize_template(v, scale) for k, v in self.orb_icons.items()}
@@ -996,7 +1009,7 @@ class Matcher():
             
             # if the region is supposedly single attribute, check for orbs
             if not sattr:
-                num_orbs = self.count_orbs(reg, orbs, scale, standardize=False)
+                num_orbs = self.count_orbs(reg, orbs, standardize=False)
                 if num_orbs > 1:
                     continue
             
@@ -1026,8 +1039,7 @@ class Matcher():
         for attrs, bboxes in predictions.items():
             matched, unmatched = self.identify_region(
                                                 img, img_rgb, attrs, 
-                                                bboxes, icons, scale,
-                                                icon_offsets)
+                                                bboxes, icons, icon_offsets)
             matched_cards += matched
             unmatched_cards[attrs] = unmatched
             
@@ -1043,8 +1055,7 @@ class Matcher():
                 for attrs in [attr + s for s in ['r', 'b', 'g', 'l', 'd']]:
                     new_match, unmatched = self.identify_region(
                                                         img, img_rgb, attrs,
-                                                        [bbox], icons, scale,
-                                                        icon_offsets)
+                                                        [bbox], icons, icon_offsets)
                     # check all attributes to look for the best match
                     if not new_match:
                         continue
@@ -1074,7 +1085,7 @@ class Matcher():
             
         # compile match info
         frame_info = {
-            'source_id': array_id(rgb_image),
+            'source_id': source_id,
             'source_frame': source_frame,
             'source_filepath': source_filepath,
             'scale': scale,
@@ -1091,23 +1102,29 @@ class Matcher():
         frame_info.update(scroll_info)
         [match.update(frame_info) for match in matched_cards]
         
-        # update list of matches
-        self.matched_cards += matched_cards
-        self.matched_frames += frame_info
+        # convert to dataframe
+        match_data = self.get_match_dataframe(matched_cards)
         
-        return matched_cards, frame_info
+        # update list of matches
+        self.matches = pd.concat([self.matches, match_data])
+        self.matches.drop_duplicates(subset=['source_id', 'bbox'], inplace=True,
+                                     keep='last')
+        
+        # save data
+        self.save_user()
+        
+        return match_data
     
+    # =============================================================================
+    # PRIMARY ROUTINES
+    # =============================================================================
     def identify_inputs(self):
-        for fmt, media_types in self.inputs.items():
-            for media_type, media_list in media_types.items():
-                if media_type == 'images':
-                    for image in media_list:
-                        match_info = self.identify_image(image)
-                elif media_type == 'videos':
-                    for video in media_list:
-                        match_info = self.identify_video(video)
+        for image in self.images:
+            match_info = self.identify_image(image)
+        for video in self.videos:
+            match_info = self.identify_video(video)
             
-        return self.matched_cards, self.matched_frames
+        return self.matches
         
 # =============================================================================
 # OPTIMIZING SCALE
@@ -1439,66 +1456,35 @@ def peek(array: np.ndarray) -> None:
         print(f'Could not show image: {ex}')
 
 # =============================================================================
-# LOADING VIDEO
-# =============================================================================
-def load_video_frames(filepath: str):
-    if not os.path.exists(filepath):
-        return print(f'{filepath} does not exist')
-    frames = None
-    print(f'Loading video frames from {filepath}')
-    try:
-        # initialize video capture
-        capture = cv2.VideoCapture(filepath)
-        
-        # create array to store frames in
-        channels = 3
-        num_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frames = np.empty((num_frames, frame_h, frame_w, channels), 'uint8')
-        
-        # read the video frames
-        framecount = 0
-        has_data = True
-        while framecount < num_frames and has_data:
-            has_data, frame = capture.read()
-            frames[framecount] = to_rgb(frame)
-            framecount += 1
-            
-        print(f'Loaded {frame_w} by {frame_h} video containing',
-              f'{num_frames} frames in {time.time()-t0:.3f} seconds')
-        return frames
-    
-    except OSError as ose:
-        return print(f'Unable to load video frames: {ose}')
-    except Exception as ex:
-        return print(f'Unable to load video frames: {ex}')
-        
-# =============================================================================
 # LOCAL TESTING
 # =============================================================================
 if __name__ == '__main__':
     t0 = time.time()
     
     os.chdir(os.path.dirname(__file__))
-    ss_path = os.path.abspath('../assets/screenshots/box_test_assisting.png')
-    vid_path = os.path.abspath('../assets/screenshots/sample_video_2.mp4')
+    ss_path = os.path.abspath('../users/test/screenshots/box_test_assisting.png')
+    vid_path = os.path.abspath('../users/test/videos/sample_video_2.mp4')
     
     # cards, frames = Matcher(ss_path).identify_inputs()
-    cards, frames = Matcher(vid_path).identify_inputs()
+    # cards, frames = Matcher(vid_path).identify_inputs()
     
-    # df, df = Matcher(vid_path).identify_video(vid_path)
+    # df = Matcher(vid_path).identify_video(vid_path)
+    df = Matcher(ss_path).identify_image(ss_path, update=False)
+    
+    # vid = load_video_frames(vid_path)
     
     print(f'Finished in {time.time()-t0:.3f} seconds')
 
 # =============================================================================
 # TODO LIST
 # =============================================================================
-'''
-    - Detect "Assisting" cards
-    - Store monster list
-    - Create UI for interacting
-    - Accept manual override grade (either add new or reject)
-    - Create stitched image of all icons from box list
+# - Store config and previous matches
+# - Store monster list
+# - Create UI for interacting
+# - Accept manual override grade (either add new or reject)
+# - Create stitched image of all icons from box list
+# - Read video frames one at a time rather than all at once
 
-'''
+# =============================================================================
+# NOTES
+# =============================================================================
